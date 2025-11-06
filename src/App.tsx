@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { ShoppingItem, PurchaseStatus } from './types';
 import ImportScreen from './components/ImportScreen';
@@ -380,7 +379,6 @@ const App: React.FC = () => {
     return null; // or a loading spinner
   }
 
-  const hasEventLists = Object.keys(eventLists).length > 0;
   const mainContentVisible = activeTab === 'day1' || activeTab === 'day2';
   
   const handleZoomChange = (newZoom: number) => {
