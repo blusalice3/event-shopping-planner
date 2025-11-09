@@ -17,7 +17,6 @@ export function insertItemSorted(items: ShoppingItem[], newItem: ShoppingItem): 
   
   // 同じ参加日のアイテムのみを対象にソート
   const sameDayItems = newItems.filter(item => item.eventDate === newItem.eventDate);
-  const otherDayItems = newItems.filter(item => item.eventDate !== newItem.eventDate);
   
   let insertIndex = 0;
   for (let i = 0; i < sameDayItems.length; i++) {
