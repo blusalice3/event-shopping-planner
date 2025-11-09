@@ -692,31 +692,6 @@ const App: React.FC = () => {
       setShowUrlUpdateDialog(true);
     }
   }, [eventLists, eventMetadata]);
-        const existingWithoutTitle = currentItemsMapWithoutTitle.get(keyWithoutTitle);
-        if (existingWithoutTitle) {
-          // タイトルや価格、備考が変わっていれば更新
-          itemsToUpdate.push({
-            ...existingWithoutTitle,
-            title: sheetItem.title,
-            price: sheetItem.price,
-            remarks: sheetItem.remarks
-          });
-          processedSheetKeys.add(keyWithoutTitle);
-          return;
-        }
-        
-        // 新規追加
-        itemsToAdd.push(sheetItem);
-      });
-
-      setUpdateData({ itemsToDelete, itemsToUpdate, itemsToAdd });
-      setShowUpdateConfirmation(true);
-    } catch (error) {
-      console.error('Update error:', error);
-      setPendingUpdateEventName(eventName);
-      setShowUrlUpdateDialog(true);
-    }
-  }, [eventLists, eventMetadata]);
 
   const handleConfirmUpdate = useCallback(() => {
     if (!updateData || !activeEventName) return;
