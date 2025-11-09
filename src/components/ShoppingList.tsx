@@ -5,19 +5,20 @@ import ShoppingItemCard from './ShoppingItemCard';
 interface ShoppingListProps {
   items: ShoppingItem[];
   onUpdateItem: (item: ShoppingItem) => void;
-  onMoveItem: (dragId: string, hoverId: string) => void;
+  onMoveItem: (dragId: string, hoverId: string, targetColumn?: 'execute' | 'candidate') => void;
   onEditRequest: (item: ShoppingItem) => void;
   onDeleteRequest: (item: ShoppingItem) => void;
   selectedItemIds: Set<string>;
   onSelectItem: (itemId: string) => void;
-  columnType?: 'execute' | 'candidate';
   onMoveToColumn?: (itemIds: string[]) => void;
   onRemoveFromColumn?: (itemIds: string[]) => void;
+  columnType?: 'execute' | 'candidate';
 }
 
-const SCROLL_SPEED = 20;
-const TOP_SCROLL_TRIGGER_PX = 150;
-const BOTTOM_SCROLL_TRIGGER_PX = 100;
+// Constants for drag-and-drop auto-scrolling
+const SCROLL_SPEED = 20; // Speed of scrolling in pixels
+const TOP_SCROLL_TRIGGER_PX = 150; // Trigger zone from the top of the viewport (header/tabs area)
+const BOTTOM_SCROLL_TRIGGER_PX = 100; // Trigger zone from the bottom of the viewport (summary bar area)
 
 const ShoppingList: React.FC<ShoppingListProps> = ({
   items,
@@ -27,18 +28,16 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
   onDeleteRequest,
   selectedItemIds,
   onSelectItem,
-  columnType = 'execute',
   onMoveToColumn,
   onRemoveFromColumn,
+  columnType,
 }) => {
   const dragItem = useRef<string | null>(null);
   const dragOverItem = useRef<string | null>(null);
-  const dragSourceColumn = useRef<'execute' | 'candidate' | null>(null);
 
   const handleDragStart = (e: React.DragEvent<HTMLDivElement>, item: ShoppingItem) => {
     dragItem.current = item.id;
-    dragSourceColumn.current = columnType;
-    const target = e.currentTarget;
+    const target = e.currentTarget; // Cache target to avoid issues with React event pooling
     setTimeout(() => {
         if(target) {
             target.classList.add('opacity-40');
@@ -51,6 +50,7 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
 
   const handleDragEnter = (e: React.DragEvent<HTMLDivElement>, item: ShoppingItem) => {
     e.preventDefault();
+    // Prevent dropping a selection onto itself
     if (selectedItemIds.has(item.id)) {
         dragOverItem.current = null;
     } else {
@@ -72,23 +72,8 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
   };
 
   const handleDrop = () => {
-    if (dragItem.current !== null) {
-      // 異なる列間の移動
-      if (dragSourceColumn.current !== columnType) {
-        const draggedIds = selectedItemIds.has(dragItem.current) 
-          ? Array.from(selectedItemIds) 
-          : [dragItem.current];
-        
-        if (columnType === 'execute' && onMoveToColumn) {
-          onMoveToColumn(draggedIds);
-        } else if (columnType === 'candidate' && onRemoveFromColumn) {
-          onRemoveFromColumn(draggedIds);
-        }
-      } 
-      // 同じ列内での並び替え
-      else if (dragOverItem.current !== null && dragItem.current !== dragOverItem.current) {
-        onMoveItem(dragItem.current, dragOverItem.current);
-      }
+    if (dragItem.current !== null && dragOverItem.current !== null && dragItem.current !== dragOverItem.current) {
+      onMoveItem(dragItem.current, dragOverItem.current, columnType);
     }
   };
 
@@ -97,18 +82,10 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
     document.querySelectorAll('[data-is-selected="true"]').forEach(el => el.classList.remove('opacity-40'));
     dragItem.current = null;
     dragOverItem.current = null;
-    dragSourceColumn.current = null;
   };
 
   if (items.length === 0) {
-      return (
-        <div className="text-center text-slate-500 dark:text-slate-400 py-12">
-          {columnType === 'execute' 
-            ? 'この列にアイテムはありません。' 
-            : 'この日のアイテムはありません。'
-          }
-        </div>
-      );
+      return <div className="text-center text-slate-500 dark:text-slate-400 py-12">この日のアイテムはありません。</div>
   }
 
   return (
