@@ -111,7 +111,7 @@ const EventListScreen: React.FC<EventListScreenProps> = ({ eventNames, onSelect,
                           onClick={(e) => { e.stopPropagation(); onUpdate(name); setMenuVisibleFor(null); }}
                           className="flex items-center space-x-2 px-4 py-2 text-sm text-green-600 dark:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/50 rounded-l-md transition-colors"
                       >
-                          <span>🔄 更新</span>
+                          <span>🔄 アイテム更新</span>
                       </button>
                     )}
                     <button 
