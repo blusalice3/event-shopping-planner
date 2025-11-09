@@ -670,11 +670,7 @@ const App: React.FC = () => {
         }
       });
 
-      setUpdateData({ 
-        itemsToDelete, 
-        itemsToUpdate, 
-        itemsToAdd
-      });
+      setUpdateData({ itemsToDelete, itemsToUpdate, itemsToAdd: itemsToAdd as Omit<ShoppingItem, 'id' | 'purchaseStatus'>[] });
       setShowUpdateConfirmation(true);
 
     } catch (error) {
