@@ -709,7 +709,6 @@ const App: React.FC = () => {
 
         const block = cells[2]?.trim() || '';
         const number = cells[3]?.trim() || '';
-        // ブロック列とナンバー列の値が入力されているもののみをインポート
         if (!block || !number) continue;
 
         sheetItems.push({
@@ -735,7 +734,6 @@ const App: React.FC = () => {
       const itemsToDelete: ShoppingItem[] = [];
       const itemsToUpdate: ShoppingItem[] = [];
       const itemsToAdd: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[] = [];
-      const processedSheetKeys = new Set<string>();
 
       // 削除対象: スプレッドシートにないアイテム（サークル名・参加日・ブロック・ナンバーで照合）
       currentItems.forEach(item => {
@@ -764,7 +762,6 @@ const App: React.FC = () => {
               remarks: sheetItem.remarks
             });
           }
-          processedSheetKeys.add(keyWithAll);
           return;
         }
         
@@ -778,7 +775,6 @@ const App: React.FC = () => {
             price: sheetItem.price,
             remarks: sheetItem.remarks
           });
-          processedSheetKeys.add(keyWithoutTitle);
           return;
         }
         
