@@ -51,6 +51,7 @@ const App: React.FC = () => {
     itemsToUpdate: ShoppingItem[];
     itemsToAdd: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[];
   } | null>(null);
+  const [updateEventName, setUpdateEventName] = useState<string | null>(null);
   const [showUrlUpdateDialog, setShowUrlUpdateDialog] = useState(false);
   const [pendingUpdateEventName, setPendingUpdateEventName] = useState<string | null>(null);
 
@@ -171,6 +172,7 @@ const App: React.FC = () => {
     if (!activeEventName) return;
     setSortState('Manual');
     setBlockSortDirection(null);
+    
     const currentDay = activeTab === 'day1' ? 'day1' : 'day2';
     const mode = dayModes[activeEventName]?.[currentDay] || 'edit';
 
@@ -233,7 +235,7 @@ const App: React.FC = () => {
         }
       });
     }
-  }, [activeEventName, selectedItemIds, activeTab, dayModes]);
+  }, [activeEventName, selectedItemIds, activeTab, dayModes, executeModeItems]);
 
   const handleMoveToExecuteColumn = useCallback((itemIds: string[]) => {
     if (!activeEventName) return;
@@ -793,6 +795,7 @@ const App: React.FC = () => {
       });
 
       setUpdateData({ itemsToDelete, itemsToUpdate, itemsToAdd });
+      setUpdateEventName(eventName);
       setShowUpdateConfirmation(true);
     } catch (error) {
       console.error('Update error:', error);
@@ -802,12 +805,13 @@ const App: React.FC = () => {
   }, [eventLists, eventMetadata]);
 
   const handleConfirmUpdate = () => {
-    if (!updateData || !activeEventName) return;
+    if (!updateData || !updateEventName) return;
 
     const { itemsToDelete, itemsToUpdate, itemsToAdd } = updateData;
+    const eventName = updateEventName;
     
     setEventLists(prev => {
-      let newItems: ShoppingItem[] = [...(prev[activeEventName] || [])];
+      let newItems: ShoppingItem[] = [...(prev[eventName] || [])];
       
       // 削除
       const deleteIds = new Set(itemsToDelete.map(item => item.id));
@@ -834,19 +838,19 @@ const App: React.FC = () => {
         // 候補リストに追加（実行モード列には追加しない）
       });
       
-      return { ...prev, [activeEventName]: newItems };
+      return { ...prev, [eventName]: newItems };
     });
 
     // 削除されたアイテムを実行モードアイテムからも削除
     setExecuteModeItems(prev => {
-      const eventItems = prev[activeEventName];
+      const eventItems = prev[eventName];
       if (!eventItems) return prev;
       
       const deleteIds = new Set(itemsToDelete.map(item => item.id));
       
       return {
         ...prev,
-        [activeEventName]: {
+        [eventName]: {
           day1: eventItems.day1.filter(id => !deleteIds.has(id)),
           day2: eventItems.day2.filter(id => !deleteIds.has(id))
         }
@@ -855,6 +859,7 @@ const App: React.FC = () => {
 
     setShowUpdateConfirmation(false);
     setUpdateData(null);
+    setUpdateEventName(null);
     alert('アイテムを更新しました。');
   };
 
@@ -1084,7 +1089,7 @@ const App: React.FC = () => {
                   <ShoppingList
                     items={executeColumnItems}
                     onUpdateItem={handleUpdateItem}
-                    onMoveItem={(dragId, hoverId) => handleMoveItem(dragId, hoverId, 'execute')}
+                    onMoveItem={(dragId, hoverId, targetColumn) => handleMoveItem(dragId, hoverId, targetColumn)}
                     onEditRequest={handleEditRequest}
                     onDeleteRequest={handleDeleteRequest}
                     selectedItemIds={selectedItemIds}
@@ -1092,6 +1097,7 @@ const App: React.FC = () => {
                     onRemoveFromColumn={handleRemoveFromExecuteColumn}
                     onMoveToColumn={handleMoveToExecuteColumn}
                     columnType="execute"
+                    currentDay={activeTab === 'day1' ? 'day1' : 'day2'}
                   />
                 </div>
                 
@@ -1112,13 +1118,15 @@ const App: React.FC = () => {
                   <ShoppingList
                     items={candidateColumnItems}
                     onUpdateItem={handleUpdateItem}
-                    onMoveItem={(dragId, hoverId) => handleMoveItem(dragId, hoverId, 'candidate')}
+                    onMoveItem={(dragId, hoverId, targetColumn) => handleMoveItem(dragId, hoverId, targetColumn)}
                     onEditRequest={handleEditRequest}
                     onDeleteRequest={handleDeleteRequest}
                     selectedItemIds={selectedItemIds}
                     onSelectItem={handleSelectItem}
                     onMoveToColumn={handleMoveToExecuteColumn}
+                    onRemoveFromColumn={handleRemoveFromExecuteColumn}
                     columnType="candidate"
+                    currentDay={activeTab === 'day1' ? 'day1' : 'day2'}
                   />
                 </div>
               </div>
@@ -1126,12 +1134,13 @@ const App: React.FC = () => {
               <ShoppingList
                 items={visibleItems}
                 onUpdateItem={handleUpdateItem}
-                onMoveItem={(dragId, hoverId) => handleMoveItem(dragId, hoverId, 'execute')}
+                onMoveItem={(dragId, hoverId, targetColumn) => handleMoveItem(dragId, hoverId, targetColumn)}
                 onEditRequest={handleEditRequest}
                 onDeleteRequest={handleDeleteRequest}
                 selectedItemIds={selectedItemIds}
                 onSelectItem={handleSelectItem}
                 columnType="execute"
+                currentDay={activeTab === 'day1' ? 'day1' : 'day2'}
               />
             )}
           </div>
@@ -1155,6 +1164,7 @@ const App: React.FC = () => {
           onCancel={() => {
             setShowUpdateConfirmation(false);
             setUpdateData(null);
+            setUpdateEventName(null);
           }}
         />
       )}
@@ -1183,3 +1193,4 @@ const App: React.FC = () => {
 };
 
 export default App;
+
