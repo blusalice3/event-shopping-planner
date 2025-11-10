@@ -108,10 +108,6 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
     const targetColumn = columnType;
     const sourceColumn = e.dataTransfer.getData('sourceColumn') as 'execute' | 'candidate' | undefined;
     
-    // アイテムの幅の1/3以上が画面中央より左に移動したら左列に移動
-    // 画面幅の1/3を閾値として使用
-    const threshold = windowWidth / 3;
-    
     // 候補リストから実行モード列への移動判定
     if (targetColumn === 'execute' && sourceColumn === 'candidate' && onMoveToColumn) {
       // ドロップ位置が画面中央より左にある場合（より寛容な条件）
@@ -174,7 +170,6 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
             const sourceColumn = e.dataTransfer.getData('sourceColumn') as 'execute' | 'candidate' | undefined;
             const windowWidth = window.innerWidth;
             const centerX = windowWidth / 2;
-            const threshold = windowWidth / 3;
             // 空のリストへのドロップも処理
             if (columnType === 'execute' && sourceColumn === 'candidate' && onMoveToColumn) {
               // ドロップ位置が画面中央より左にある場合
@@ -213,7 +208,6 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
           const sourceColumn = e.dataTransfer.getData('sourceColumn') as 'execute' | 'candidate' | undefined;
           const windowWidth = window.innerWidth;
           const centerX = windowWidth / 2;
-          const threshold = windowWidth / 3;
           // コンテナ全体へのドロップも処理
           if (columnType === 'execute' && sourceColumn === 'candidate' && onMoveToColumn) {
             // ドロップ位置が画面中央より左にある場合
