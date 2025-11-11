@@ -211,6 +211,75 @@ const App: React.FC = () => {
           };
         }
       });
+    } else if (mode === 'edit' && targetColumn === 'candidate') {
+      // 編集モード: 候補リスト内での並び替え
+      setEventLists(prev => {
+        const allItems = [...(prev[activeEventName] || [])];
+        const currentTabKey = activeTab === 'day1' ? '1日目' : '2日目';
+        const executeIdsSet = new Set(executeModeItems[activeEventName]?.[currentDay] || []);
+        
+        // 候補リストのアイテムのみを取得
+        const candidateItems = allItems.filter(item => 
+          item.eventDate.includes(currentTabKey) && !executeIdsSet.has(item.id)
+        );
+        
+        if (selectedItemIds.has(dragId)) {
+          // 複数選択時
+          const selectedBlock = candidateItems.filter(item => selectedItemIds.has(item.id));
+          const listWithoutSelection = candidateItems.filter(item => !selectedItemIds.has(item.id));
+          const targetItem = candidateItems.find(item => item.id === hoverId);
+          const targetIndex = listWithoutSelection.findIndex(item => item.id === hoverId);
+          
+          if (targetIndex === -1 || !targetItem) return prev;
+          
+          listWithoutSelection.splice(targetIndex, 0, ...selectedBlock);
+          
+          // 実行モード列のアイテムはそのまま、候補リストのみ並び替え
+          const executeItems = allItems.filter(item => 
+            item.eventDate.includes(currentTabKey) && executeIdsSet.has(item.id)
+          );
+          
+          const newItems = allItems.map(item => {
+            if (!item.eventDate.includes(currentTabKey)) {
+              return item;
+            }
+            if (executeIdsSet.has(item.id)) {
+              return executeItems.shift() || item;
+            } else {
+              return listWithoutSelection.shift() || item;
+            }
+          });
+          
+          return { ...prev, [activeEventName]: newItems };
+        } else {
+          // 単一アイテム
+          const dragIndex = candidateItems.findIndex(item => item.id === dragId);
+          const hoverIndex = candidateItems.findIndex(item => item.id === hoverId);
+          
+          if (dragIndex === -1 || hoverIndex === -1) return prev;
+          
+          const [draggedItem] = candidateItems.splice(dragIndex, 1);
+          candidateItems.splice(hoverIndex, 0, draggedItem);
+          
+          // 実行モード列のアイテムはそのまま、候補リストのみ並び替え
+          const executeItems = allItems.filter(item => 
+            item.eventDate.includes(currentTabKey) && executeIdsSet.has(item.id)
+          );
+          
+          const newItems = allItems.map(item => {
+            if (!item.eventDate.includes(currentTabKey)) {
+              return item;
+            }
+            if (executeIdsSet.has(item.id)) {
+              return executeItems.shift() || item;
+            } else {
+              return candidateItems.shift() || item;
+            }
+          });
+          
+          return { ...prev, [activeEventName]: newItems };
+        }
+      });
     } else if (mode === 'execute') {
       // 実行モード: 通常の並び替え
       setEventLists(prev => {
@@ -1224,4 +1293,3 @@ const App: React.FC = () => {
 };
 
 export default App;
-
