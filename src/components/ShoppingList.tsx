@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useRef, useState, useMemo } from 'react';
 import { ShoppingItem } from '../types';
 import ShoppingItemCard from './ShoppingItemCard';
 
@@ -21,6 +21,103 @@ const SCROLL_SPEED = 20;
 const TOP_SCROLL_TRIGGER_PX = 150;
 const BOTTOM_SCROLL_TRIGGER_PX = 100;
 
+// 色のパレット定義（十分な数の色を用意）
+const colorPalette: Array<{ light: string; dark: string }> = [
+  { light: 'bg-red-50 dark:bg-red-950/30', dark: 'bg-red-100 dark:bg-red-900/40' },
+  { light: 'bg-orange-50 dark:bg-orange-950/30', dark: 'bg-orange-100 dark:bg-orange-900/40' },
+  { light: 'bg-amber-50 dark:bg-amber-950/30', dark: 'bg-amber-100 dark:bg-amber-900/40' },
+  { light: 'bg-yellow-50 dark:bg-yellow-950/30', dark: 'bg-yellow-100 dark:bg-yellow-900/40' },
+  { light: 'bg-lime-50 dark:bg-lime-950/30', dark: 'bg-lime-100 dark:bg-lime-900/40' },
+  { light: 'bg-green-50 dark:bg-green-950/30', dark: 'bg-green-100 dark:bg-green-900/40' },
+  { light: 'bg-emerald-50 dark:bg-emerald-950/30', dark: 'bg-emerald-100 dark:bg-emerald-900/40' },
+  { light: 'bg-teal-50 dark:bg-teal-950/30', dark: 'bg-teal-100 dark:bg-teal-900/40' },
+  { light: 'bg-cyan-50 dark:bg-cyan-950/30', dark: 'bg-cyan-100 dark:bg-cyan-900/40' },
+  { light: 'bg-sky-50 dark:bg-sky-950/30', dark: 'bg-sky-100 dark:bg-sky-900/40' },
+  { light: 'bg-blue-50 dark:bg-blue-950/30', dark: 'bg-blue-100 dark:bg-blue-900/40' },
+  { light: 'bg-indigo-50 dark:bg-indigo-950/30', dark: 'bg-indigo-100 dark:bg-indigo-900/40' },
+  { light: 'bg-violet-50 dark:bg-violet-950/30', dark: 'bg-violet-100 dark:bg-violet-900/40' },
+  { light: 'bg-purple-50 dark:bg-purple-950/30', dark: 'bg-purple-100 dark:bg-purple-900/40' },
+  { light: 'bg-fuchsia-50 dark:bg-fuchsia-950/30', dark: 'bg-fuchsia-100 dark:bg-fuchsia-900/40' },
+  { light: 'bg-pink-50 dark:bg-pink-950/30', dark: 'bg-pink-100 dark:bg-pink-900/40' },
+  { light: 'bg-rose-50 dark:bg-rose-950/30', dark: 'bg-rose-100 dark:bg-rose-900/40' },
+  { light: 'bg-slate-50 dark:bg-slate-950/30', dark: 'bg-slate-100 dark:bg-slate-900/40' },
+  { light: 'bg-gray-50 dark:bg-gray-950/30', dark: 'bg-gray-100 dark:bg-gray-900/40' },
+  { light: 'bg-zinc-50 dark:bg-zinc-950/30', dark: 'bg-zinc-100 dark:bg-zinc-900/40' },
+  { light: 'bg-stone-50 dark:bg-stone-950/30', dark: 'bg-stone-100 dark:bg-stone-900/40' },
+  { light: 'bg-neutral-50 dark:bg-neutral-950/30', dark: 'bg-neutral-100 dark:bg-neutral-900/40' },
+  { light: 'bg-red-100 dark:bg-red-900/40', dark: 'bg-red-200 dark:bg-red-800/50' },
+  { light: 'bg-orange-100 dark:bg-orange-900/40', dark: 'bg-orange-200 dark:bg-orange-800/50' },
+  { light: 'bg-amber-100 dark:bg-amber-900/40', dark: 'bg-amber-200 dark:bg-amber-800/50' },
+  { light: 'bg-yellow-100 dark:bg-yellow-900/40', dark: 'bg-yellow-200 dark:bg-yellow-800/50' },
+  { light: 'bg-lime-100 dark:bg-lime-900/40', dark: 'bg-lime-200 dark:bg-lime-800/50' },
+  { light: 'bg-green-100 dark:bg-green-900/40', dark: 'bg-green-200 dark:bg-green-800/50' },
+  { light: 'bg-emerald-100 dark:bg-emerald-900/40', dark: 'bg-emerald-200 dark:bg-emerald-800/50' },
+  { light: 'bg-teal-100 dark:bg-teal-900/40', dark: 'bg-teal-200 dark:bg-teal-800/50' },
+  { light: 'bg-cyan-100 dark:bg-cyan-900/40', dark: 'bg-cyan-200 dark:bg-cyan-800/50' },
+  { light: 'bg-sky-100 dark:bg-sky-900/40', dark: 'bg-sky-200 dark:bg-sky-800/50' },
+];
+
+// アイテムリストからブロックベースの色情報を計算
+const calculateBlockColors = (items: ShoppingItem[]): Map<string, string> => {
+  const colorMap = new Map<string, string>();
+  
+  // 未購入のアイテムから実際に存在するブロック値を収集
+  const uniqueBlocks = new Set<string>();
+  items.forEach(item => {
+    if (item.purchaseStatus === 'None') {
+      uniqueBlocks.add(item.block);
+    }
+  });
+  
+  // ブロック値をソート（数値と文字列の両方に対応）
+  const sortedBlocks = Array.from(uniqueBlocks).sort((a, b) => {
+    // 数値として比較できる場合は数値で比較
+    const numA = Number(a);
+    const numB = Number(b);
+    if (!isNaN(numA) && !isNaN(numB)) {
+      return numA - numB;
+    }
+    // 文字列として比較
+    return a.localeCompare(b);
+  });
+  
+  // ブロック値ごとに色を割り当て
+  const blockColorMap = new Map<string, { light: string; dark: string }>();
+  sortedBlocks.forEach((block, index) => {
+    // 色のパレットから循環的に色を割り当て
+    const colorIndex = index % colorPalette.length;
+    blockColorMap.set(block, colorPalette[colorIndex]);
+  });
+  
+  // 各アイテムに色を割り当て（同じブロック値のアイテム同士で交互に色を付ける）
+  items.forEach((item, index) => {
+    // 未購入のアイテムのみブロックベースの色を適用
+    if (item.purchaseStatus === 'None') {
+      const block = item.block;
+      const blockColor = blockColorMap.get(block);
+      
+      if (blockColor) {
+        // 同じブロック値のアイテム同士で交互に色を付ける
+        // 前のアイテムが同じブロック値かどうかを確認
+        const prevItem = index > 0 ? items[index - 1] : null;
+        const isSameBlockAsPrev = prevItem && prevItem.block === block && prevItem.purchaseStatus === 'None';
+        
+        if (isSameBlockAsPrev) {
+          // 前のアイテムと同じブロック値の場合、交互に色を付ける
+          const prevColor = colorMap.get(items[index - 1].id) || '';
+          const shouldUseDark = prevColor === blockColor.light;
+          colorMap.set(item.id, shouldUseDark ? blockColor.dark : blockColor.light);
+        } else {
+          // 前のアイテムと異なるブロック値の場合、薄い色から開始
+          colorMap.set(item.id, blockColor.light);
+        }
+      }
+    }
+  });
+  
+  return colorMap;
+};
+
 const ShoppingList: React.FC<ShoppingListProps> = ({
   items,
   onUpdateItem,
@@ -38,6 +135,9 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
   const dragOverItem = useRef<string | null>(null);
   const [insertPosition, setInsertPosition] = useState<number | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // ブロックベースの色情報を計算
+  const blockColorMap = useMemo(() => calculateBlockColors(items), [items]);
 
   const handleDragStart = (e: React.DragEvent<HTMLDivElement>, item: ShoppingItem) => {
     dragItem.current = item.id;
@@ -182,6 +282,7 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
               onDeleteRequest={onDeleteRequest}
               isSelected={selectedItemIds.has(item.id)}
               onSelectItem={onSelectItem}
+              blockBackgroundColor={blockColorMap.get(item.id)}
             />
           </div>
           {/* 最後のアイテムの後に挿入位置インジケーター */}
