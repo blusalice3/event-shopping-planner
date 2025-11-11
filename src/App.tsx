@@ -962,6 +962,16 @@ const App: React.FC = () => {
     const itemsForTab = activeTab === 'day1' ? day1Items : day2Items;
     return itemsForTab.filter(item => !executeIds.has(item.id));
   }, [activeEventName, activeTab, executeModeItems, day1Items, day2Items]);
+
+  // 候補リストのアイテムが選択されているかチェック
+  const hasCandidateSelection = useMemo(() => {
+    if (!activeEventName || currentMode !== 'edit' || selectedItemIds.size === 0) return false;
+    const currentDay = activeTab === 'day1' ? 'day1' : 'day2';
+    const executeIds = new Set(executeModeItems[activeEventName]?.[currentDay] || []);
+    const selectedItems = items.filter(item => selectedItemIds.has(item.id));
+    const itemsForTab = activeTab === 'day1' ? day1Items : day2Items;
+    return selectedItems.some(item => itemsForTab.includes(item) && !executeIds.has(item.id));
+  }, [activeEventName, activeTab, currentMode, selectedItemIds, items, executeModeItems, day1Items, day2Items]);
   
   if (!isInitialized) {
     return null;
@@ -1012,10 +1022,20 @@ const App: React.FC = () => {
           {activeEventName && mainContentVisible && items.length > 0 && (
                 <div className="flex items-center gap-4">
                     {selectedItemIds.size > 0 && (
-                        <BulkActionControls
-                            onSort={handleBulkSort}
-                            onClear={handleClearSelection}
-                        />
+                        <>
+                            <BulkActionControls
+                                onSort={handleBulkSort}
+                                onClear={handleClearSelection}
+                            />
+                            {hasCandidateSelection && (
+                                <button
+                                    onClick={() => handleMoveToExecuteColumn(Array.from(selectedItemIds))}
+                                    className="px-3 py-1.5 text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 transition-colors flex-shrink-0"
+                                >
+                                    選択したアイテムを左列に移動 ({selectedItemIds.size}件)
+                                </button>
+                            )}
+                        </>
                     )}
                     {currentMode === 'execute' && (
                       <button
@@ -1084,7 +1104,7 @@ const App: React.FC = () => {
                 <div className="space-y-2">
                   <div className="bg-blue-50 dark:bg-blue-900/20 border-2 border-blue-300 dark:border-blue-700 rounded-lg p-3">
                     <h3 className="text-sm font-semibold text-blue-900 dark:text-blue-100 mb-2">実行モード表示列</h3>
-                    <p className="text-xs text-blue-700 dark:text-blue-300 mb-3">右の候補リストからドラッグ&ドロップでアイテムを追加</p>
+                    <p className="text-xs text-blue-700 dark:text-blue-300 mb-3">右の候補リストからアイテムを選択して移動</p>
                   </div>
                   <ShoppingList
                     items={executeColumnItems}
@@ -1105,15 +1125,7 @@ const App: React.FC = () => {
                 <div className="space-y-2">
                   <div className="bg-slate-100 dark:bg-slate-800 border-2 border-slate-300 dark:border-slate-700 rounded-lg p-3">
                     <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100 mb-2">候補リスト</h3>
-                    <p className="text-xs text-slate-600 dark:text-slate-400 mb-1">左列にドラッグして配置</p>
-                    {selectedItemIds.size > 0 && (
-                      <button
-                        onClick={() => handleMoveToExecuteColumn(Array.from(selectedItemIds))}
-                        className="mt-2 w-full px-3 py-1.5 text-xs font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 transition-colors"
-                      >
-                        選択したアイテムを左列に移動 ({selectedItemIds.size}件)
-                      </button>
-                    )}
+                    <p className="text-xs text-slate-600 dark:text-slate-400 mb-1">アイテムを選択してヘッダーのボタンから移動</p>
                   </div>
                   <ShoppingList
                     items={candidateColumnItems}
@@ -1193,4 +1205,3 @@ const App: React.FC = () => {
 };
 
 export default App;
-
