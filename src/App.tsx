@@ -703,7 +703,7 @@ const App: React.FC = () => {
       const resultItems: ShoppingItem[] = [];
       let candidateIndex = 0;
       
-      allItems.forEach((item, index) => {
+      allItems.forEach((item) => {
         if (!item.eventDate.includes(currentTabKey)) {
           resultItems.push(item);
         } else if (executeIds.has(item.id)) {
