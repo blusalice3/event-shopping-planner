@@ -1,8 +1,9 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { ShoppingItem } from '../types';
+import { getItemKey } from '../utils/itemComparison';
 
 interface ImportScreenProps {
-  onBulkAdd: (eventName: string, items: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[], metadata?: { url?: string; sheetName?: string }) => void;
+  onBulkAdd: (eventName: string, items: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[], metadata?: { url?: string; sheetName?: string, layoutInfo?: Array<{ itemKey: string, eventDate: string, columnType: 'execute' | 'candidate', order: number }> }) => void;
   activeEventName: string | null;
   itemToEdit: ShoppingItem | null;
   onUpdateItem: (item: ShoppingItem) => void;
@@ -100,13 +101,28 @@ const ImportScreen: React.FC<ImportScreenProps> = ({ onBulkAdd, activeEventName,
     return cells;
   };
 
-  const processImportData = (lines: string[]): Omit<ShoppingItem, 'id' | 'purchaseStatus'>[] => {
+  const processImportData = (lines: string[]): {
+    items: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[];
+    spreadsheetUrl?: string;
+    layoutInfo?: Array<{ itemKey: string, eventDate: string, columnType: 'execute' | 'candidate', order: number }>;
+  } => {
     const newItems: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[] = [];
+    let spreadsheetUrl: string | undefined;
+    const layoutInfo: Array<{ itemKey: string, eventDate: string, columnType: 'execute' | 'candidate', order: number }> = [];
+    
+    // メタデータ行をチェック
+    let startIndex = 0;
+    if (lines.length > 0 && lines[0].startsWith('#METADATA')) {
+      const metadataCells = parseCSVLine(lines[0]);
+      if (metadataCells.length >= 3 && metadataCells[1] === 'spreadsheetUrl') {
+        spreadsheetUrl = metadataCells[2]?.trim();
+      }
+      startIndex = 1;
+    }
     
     // ヘッダー行をスキップ
-    let startIndex = 0;
-    if (lines.length > 0 && lines[0].includes('サークル名')) {
-      startIndex = 1;
+    if (lines.length > startIndex && lines[startIndex].includes('サークル名')) {
+      startIndex += 1;
     }
     
     for (let i = startIndex; i < lines.length; i++) {
@@ -123,6 +139,19 @@ const ImportScreen: React.FC<ImportScreenProps> = ({ onBulkAdd, activeEventName,
       let title = cells[4]?.trim() || ''; // E列: タイトル
       let priceStr = cells[5]?.trim() || '0'; // F列: 頒布価格
       let remarks = cells[7]?.trim() || ''; // H列: 備考
+      let columnType: 'execute' | 'candidate' | null = null; // I列: 列の種類
+      let order = 0; // J列: 列内順番
+      
+      // 配置情報がある場合（エクスポートされたCSV形式）
+      if (cells.length >= 10) {
+        const columnTypeStr = cells[8]?.trim() || '';
+        if (columnTypeStr === '実行列') {
+          columnType = 'execute';
+        } else if (columnTypeStr === '候補リスト') {
+          columnType = 'candidate';
+        }
+        order = parseInt(cells[9]?.trim() || '0', 10) || 0;
+      }
       
       // A列からD列が全て入力されているかチェック
       if (!circle || !eventDate || !block || !number) {
@@ -143,7 +172,7 @@ const ImportScreen: React.FC<ImportScreenProps> = ({ onBulkAdd, activeEventName,
       
       const price = parseInt(priceStr.replace(/[^0-9]/g, ''), 10) || 0;
       
-      newItems.push({
+      const item: Omit<ShoppingItem, 'id' | 'purchaseStatus'> = {
         circle,
         eventDate,
         block,
@@ -151,10 +180,27 @@ const ImportScreen: React.FC<ImportScreenProps> = ({ onBulkAdd, activeEventName,
         title,
         price,
         remarks,
-      });
+      };
+      
+      newItems.push(item);
+      
+      // 配置情報を記録
+      if (columnType && order > 0) {
+        const itemKey = getItemKey(item);
+        layoutInfo.push({
+          itemKey,
+          eventDate,
+          columnType,
+          order,
+        });
+      }
     }
     
-    return newItems;
+    return {
+      items: newItems,
+      spreadsheetUrl,
+      layoutInfo: layoutInfo.length > 0 ? layoutInfo : undefined,
+    };
   };
 
   const handleFileImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -163,14 +209,22 @@ const ImportScreen: React.FC<ImportScreenProps> = ({ onBulkAdd, activeEventName,
 
     const text = await file.text();
     const lines = text.split('\n').filter(line => line.trim() !== '');
-    const newItems = processImportData(lines);
+    const importResult = processImportData(lines);
     
-    if (newItems.length > 0) {
-      onBulkAdd(eventName || 'インポートリスト', newItems);
+    if (importResult.items.length > 0) {
+      const metadata: { url?: string; layoutInfo?: Array<{ itemKey: string, eventDate: string, columnType: 'execute' | 'candidate', order: number }> } = {};
+      if (importResult.spreadsheetUrl) {
+        metadata.url = importResult.spreadsheetUrl;
+      }
+      if (importResult.layoutInfo) {
+        metadata.layoutInfo = importResult.layoutInfo;
+      }
+      
+      onBulkAdd(eventName || 'インポートリスト', importResult.items, Object.keys(metadata).length > 0 ? metadata : undefined);
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
-      alert(`${newItems.length}件のアイテムをインポートしました。`);
+      alert(`${importResult.items.length}件のアイテムをインポートしました。${importResult.spreadsheetUrl ? 'スプレッドシートURLも保存されました。' : ''}`);
     } else {
       alert('インポートできるデータが見つかりませんでした。A列からD列の値が全て入力されている行が必要です。');
     }
