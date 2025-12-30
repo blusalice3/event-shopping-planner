@@ -1,6 +1,18 @@
 import React, { useRef, useState, useMemo } from 'react';
-import { ShoppingItem } from '../types';
+import { ShoppingItem, HallDefinition, DayMapData, BlockDefinition } from '../types';
 import ShoppingItemCard from './ShoppingItemCard';
+
+// 優先度レベルの型
+type PriorityLevel = 'none' | 'priority' | 'highest';
+
+interface HallGroup {
+  groupId: string | null;
+  hallId: string | null;
+  hallName: string | null;
+  hallColor?: string;
+  priority: PriorityLevel;
+  items: ShoppingItem[];
+}
 
 interface ShoppingListProps {
   items: ShoppingItem[];
@@ -21,7 +33,69 @@ interface ShoppingListProps {
   onToggleRangeSelection?: (columnType: 'execute' | 'candidate') => void;
   duplicateCircleItemIds?: Set<string>;
   highlightedItemId?: string | null;
+  layoutMode?: 'pc' | 'smartphone';
+  // ホールグループ化用のprops
+  showHallGroups?: boolean;
+  hallDefinitions?: HallDefinition[];
+  hallOrder?: string[];
+  mapData?: DayMapData | null;
 }
+
+// グループIDからホールIDと優先度を分離するヘルパー
+const parseGroupId = (groupId: string | null): { hallId: string | null; priority: PriorityLevel } => {
+  if (groupId === null) return { hallId: null, priority: 'none' };
+  if (groupId === 'undefined:highest') return { hallId: null, priority: 'highest' };
+  if (groupId === 'undefined:priority') return { hallId: null, priority: 'priority' };
+  if (groupId.endsWith(':highest')) {
+    return { hallId: groupId.replace(':highest', ''), priority: 'highest' };
+  }
+  if (groupId.endsWith(':priority')) {
+    return { hallId: groupId.replace(':priority', ''), priority: 'priority' };
+  }
+  return { hallId: groupId, priority: 'none' };
+};
+
+// ホールIDと優先度からグループIDを生成するヘルパー
+const buildGroupId = (hallId: string | null, priority: PriorityLevel): string | null => {
+  if (hallId === null) {
+    if (priority === 'highest') return 'undefined:highest';
+    if (priority === 'priority') return 'undefined:priority';
+    return null;
+  }
+  if (priority === 'highest') return `${hallId}:highest`;
+  if (priority === 'priority') return `${hallId}:priority`;
+  return hallId;
+};
+
+// グループの表示名を取得
+const getGroupDisplayName = (groupId: string | null, hallDefinitions: HallDefinition[]): string => {
+  if (groupId === null) return 'ホール未定義';
+  if (groupId === 'undefined:highest') return '未定義最優先';
+  if (groupId === 'undefined:priority') return '未定義優先';
+  
+  const { hallId, priority } = parseGroupId(groupId);
+  const hall = hallDefinitions.find(h => h.id === hallId);
+  const hallName = hall?.name || 'ホール未定義';
+  
+  if (priority === 'highest') return `${hallName}最優先`;
+  if (priority === 'priority') return `${hallName}優先`;
+  return hallName;
+};
+
+// グループのヘッダースタイルを取得
+const getGroupHeaderStyle = (groupId: string | null, hallDefinitions: HallDefinition[]): { bgClass: string; borderColor: string } => {
+  const { hallId, priority } = parseGroupId(groupId);
+  const hall = hallDefinitions.find(h => h.id === hallId);
+  const baseColor = hall?.color || '#9CA3AF';
+  
+  if (priority === 'highest') {
+    return { bgClass: 'bg-red-100 dark:bg-red-900/40', borderColor: '#EF4444' };
+  }
+  if (priority === 'priority') {
+    return { bgClass: 'bg-orange-100 dark:bg-orange-900/40', borderColor: '#F97316' };
+  }
+  return { bgClass: 'bg-slate-100 dark:bg-slate-800', borderColor: baseColor };
+};
 
 // Constants for drag-and-drop auto-scrolling
 const SCROLL_SPEED = 20;
@@ -107,6 +181,11 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
   onToggleRangeSelection,
   duplicateCircleItemIds = new Set(),
   highlightedItemId = null,
+  layoutMode = 'pc',
+  showHallGroups = false,
+  hallDefinitions = [],
+  hallOrder = [],
+  mapData = null,
 }) => {
   const dragItem = useRef<string | null>(null);
   const dragSourceColumn = useRef<'execute' | 'candidate' | null>(null);
@@ -114,9 +193,195 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
   
   const [activeDropTarget, setActiveDropTarget] = useState<{ id: string; position: 'top' | 'bottom' } | null>(null);
 
+  // ホールごとにアイテムをグループ化（優先度対応版）
+  const hallGroups = useMemo((): HallGroup[] => {
+    if (!showHallGroups || hallDefinitions.length === 0) {
+      return [{ groupId: null, hallId: null, hallName: null, priority: 'none', items }];
+    }
+
+    // アイテムのホールIDを取得するヘルパー（useMemo内で定義）
+    const getHallIdForItem = (item: ShoppingItem): string | null => {
+      if (!mapData) return null;
+      
+      const block = mapData.blocks.find((b: BlockDefinition) => b.name === item.block);
+      if (!block) return null;
+      
+      const numMatch = item.number?.match(/\d+/);
+      if (!numMatch) return null;
+      const num = parseInt(numMatch[0], 10);
+      
+      const cell = block.numberCells.find((nc: { row: number; col: number; value: number }) => nc.value === num);
+      if (!cell) return null;
+      
+      // 多角形内判定（レイキャスティング法）
+      const isPointInPoly = (row: number, col: number, vertices: { row: number; col: number }[]): boolean => {
+        if (vertices.length < 3) return false;
+        let inside = false;
+        for (let i = 0, j = vertices.length - 1; i < vertices.length; j = i++) {
+          const xi = vertices[i].col, yi = vertices[i].row;
+          const xj = vertices[j].col, yj = vertices[j].row;
+          if (((yi > row) !== (yj > row)) && (col < (xj - xi) * (row - yi) / (yj - yi) + xi)) {
+            inside = !inside;
+          }
+        }
+        return inside;
+      };
+      
+      for (const hall of hallDefinitions) {
+        for (const vertex of hall.vertices) {
+          if (vertex.row === cell.row && vertex.col === cell.col) {
+            return hall.id;
+          }
+        }
+        if (isPointInPoly(cell.row, cell.col, hall.vertices)) {
+          return hall.id;
+        }
+      }
+      return null;
+    };
+
+    // アイテムのグループIDを取得
+    const getItemGroupId = (item: ShoppingItem): string | null => {
+      const hallId = getHallIdForItem(item);
+      const priority = item.priorityLevel || 'none';
+      return buildGroupId(hallId, priority);
+    };
+
+    const hallMap = new Map<string, HallDefinition>();
+    hallDefinitions.forEach(hall => hallMap.set(hall.id, hall));
+
+    // グループ化（グループIDをキーに）
+    const groups = new Map<string | null, ShoppingItem[]>();
+    
+    items.forEach((item) => {
+      const groupId = getItemGroupId(item);
+      if (!groups.has(groupId)) {
+        groups.set(groupId, []);
+      }
+      groups.get(groupId)!.push(item);
+    });
+
+    const result: HallGroup[] = [];
+    
+    // まずhallOrderに従ってグループを追加
+    hallOrder.forEach(groupId => {
+      if (groups.has(groupId)) {
+        const { hallId, priority } = parseGroupId(groupId);
+        const hall = hallMap.get(hallId || '');
+        result.push({
+          groupId,
+          hallId,
+          hallName: hall?.name || null,
+          hallColor: hall?.color || '#6366f1',
+          priority,
+          items: groups.get(groupId)!,
+        });
+        groups.delete(groupId);
+      }
+    });
+    
+    // hallOrderに含まれないがhallDefinitionsに含まれるホール（通常グループ）を追加
+    hallDefinitions.forEach(hall => {
+      const groupId = hall.id;
+      if (groups.has(groupId)) {
+        result.push({
+          groupId,
+          hallId: hall.id,
+          hallName: hall.name,
+          hallColor: hall.color || '#6366f1',
+          priority: 'none',
+          items: groups.get(groupId)!,
+        });
+        groups.delete(groupId);
+      }
+    });
+    
+    // 優先度付きグループで残っているものを追加
+    const remainingGroups = Array.from(groups.entries()).filter(([gId]) => gId !== null);
+    remainingGroups.forEach(([groupId, groupItems]) => {
+      const { hallId, priority } = parseGroupId(groupId);
+      const hall = hallMap.get(hallId || '');
+      result.push({
+        groupId,
+        hallId,
+        hallName: hall?.name || null,
+        hallColor: hall?.color || '#6366f1',
+        priority,
+        items: groupItems,
+      });
+    });
+    
+    // ホール未定義のアイテム（null）を最後に追加
+    if (groups.has(null)) {
+      result.push({
+        groupId: null,
+        hallId: null,
+        hallName: null,
+        priority: 'none',
+        items: groups.get(null)!,
+      });
+    }
+
+    return result;
+  }, [items, showHallGroups, hallDefinitions, hallOrder, mapData]);
+
   const blockColorMap = useMemo(() => calculateBlockColors(items), [items]);
 
-  // 範囲選択の状態を計算
+  // グループ化表示時の範囲選択情報を計算（同一グループ内のみ）
+  const groupRangeInfo = useMemo(() => {
+    if (!showHallGroups || !rangeStart || !rangeEnd || !columnType || 
+        rangeStart.columnType !== columnType || rangeEnd.columnType !== columnType) {
+      return null;
+    }
+
+    // rangeStartとrangeEndのアイテムがどのグループに属するか確認
+    let startGroupId: string | null = null;
+    let endGroupId: string | null = null;
+    let startHallIndex = -1;
+    let endHallIndex = -1;
+
+    for (const group of hallGroups) {
+      const startIdx = group.items.findIndex(item => item.id === rangeStart.itemId);
+      if (startIdx !== -1) {
+        startGroupId = group.groupId;
+        startHallIndex = startIdx;
+      }
+      const endIdx = group.items.findIndex(item => item.id === rangeEnd.itemId);
+      if (endIdx !== -1) {
+        endGroupId = group.groupId;
+        endHallIndex = endIdx;
+      }
+    }
+
+    // 異なるグループ間では範囲選択を無効化
+    if (startGroupId !== endGroupId || startHallIndex === -1 || endHallIndex === -1) {
+      return null;
+    }
+
+    const group = hallGroups.find(g => g.groupId === startGroupId);
+    if (!group) return null;
+
+    const minIndex = Math.min(startHallIndex, endHallIndex);
+    const maxIndex = Math.max(startHallIndex, endHallIndex);
+    const rangeItems = group.items.slice(minIndex, maxIndex + 1);
+    const allSelected = rangeItems.every(item => selectedItemIds.has(item.id));
+    
+    const onlyStartEndSelected = rangeItems.length > 2 && 
+      selectedItemIds.has(rangeItems[0].id) && 
+      selectedItemIds.has(rangeItems[rangeItems.length - 1].id) &&
+      rangeItems.slice(1, -1).every(item => !selectedItemIds.has(item.id));
+
+    return {
+      groupId: startGroupId,
+      startIndex: minIndex,
+      endIndex: maxIndex,
+      rangeItems,
+      allSelected,
+      onlyStartEndSelected,
+    };
+  }, [showHallGroups, rangeStart, rangeEnd, columnType, hallGroups, selectedItemIds]);
+
+  // 通常表示時の範囲選択の状態を計算
   const rangeInfo = useMemo(() => {
     if (!rangeStart || !rangeEnd || !columnType || rangeStart.columnType !== columnType || rangeEnd.columnType !== columnType) {
       return null;
@@ -281,6 +546,178 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
       );
   }
 
+  // ホールグループ化表示
+  if (showHallGroups && hallDefinitions.length > 0) {
+    return (
+      <div 
+        ref={containerRef}
+        className="space-y-2 pb-24 relative"
+        onDragLeave={() => setActiveDropTarget(null)} 
+      >
+        {hallGroups.map((group, groupIndex) => {
+          const headerStyle = getGroupHeaderStyle(group.groupId, hallDefinitions);
+          const displayName = getGroupDisplayName(group.groupId, hallDefinitions);
+          
+          // このグループ内での範囲選択情報
+          const isThisGroupInRange = groupRangeInfo && groupRangeInfo.groupId === group.groupId;
+          
+          return (
+          <div key={group.groupId ?? `no-hall-${groupIndex}`} className="mb-4">
+            {/* グループヘッダー */}
+            <div
+              className={`sticky top-0 z-20 flex items-center justify-between px-4 py-2 rounded-t-lg ${headerStyle.bgClass}`}
+              style={{ borderLeft: `4px solid ${headerStyle.borderColor}` }}
+            >
+              <span className="font-bold text-sm text-slate-700 dark:text-slate-300">
+                {displayName}
+              </span>
+              <span className="text-xs text-slate-500 dark:text-slate-400">
+                {group.items.length}件
+              </span>
+            </div>
+            
+            {/* グループ内アイテム */}
+            <div className="space-y-4 mt-2">
+              {group.items.map((item, hallIndex) => {
+                const globalIndex = items.findIndex(i => i.id === item.id);
+                
+                // グループ内での範囲選択状態
+                const isInRange = isThisGroupInRange && 
+                  hallIndex >= groupRangeInfo!.startIndex && 
+                  hallIndex <= groupRangeInfo!.endIndex;
+                const isStart = isThisGroupInRange && hallIndex === groupRangeInfo!.startIndex;
+                const isEnd = isThisGroupInRange && hallIndex === groupRangeInfo!.endIndex;
+                const isMiddle = isThisGroupInRange && 
+                  hallIndex > groupRangeInfo!.startIndex && 
+                  hallIndex < groupRangeInfo!.endIndex;
+
+                return (
+                  <div
+                    key={item.id}
+                    data-item-id={item.id}
+                    draggable
+                    onDragStart={(e) => handleDragStart(e, item)}
+                    onDragOver={(e) => handleDragOver(e, item)}
+                    onDrop={handleDrop}
+                    onDragEnd={cleanUp}
+                    className={`transition-opacity duration-200 relative ${
+                      group.priority === 'highest' ? 'bg-red-50/30 dark:bg-red-950/20' : 
+                      group.priority === 'priority' ? 'bg-orange-50/30 dark:bg-orange-950/20' : ''
+                    }`}
+                    data-is-selected={selectedItemIds.has(item.id)}
+                  >
+                    {activeDropTarget?.id === item.id && activeDropTarget.position === 'top' && (
+                      <div className="absolute -top-3 left-0 right-0 h-2 flex items-center justify-center z-30 pointer-events-none">
+                        <div className="w-full h-1.5 bg-blue-500 rounded-full shadow-sm ring-2 ring-white dark:ring-slate-800 transform scale-x-95 transition-transform duration-75" />
+                        <div className="absolute w-4 h-4 bg-blue-500 rounded-full -left-1 ring-2 ring-white dark:ring-slate-800" />
+                        <div className="absolute w-4 h-4 bg-blue-500 rounded-full -right-1 ring-2 ring-white dark:ring-slate-800" />
+                      </div>
+                    )}
+
+                    <ShoppingItemCard
+                      item={item}
+                      onUpdate={onUpdateItem}
+                      isStriped={globalIndex % 2 !== 0}
+                      onEditRequest={onEditRequest}
+                      onDeleteRequest={onDeleteRequest}
+                      isSelected={selectedItemIds.has(item.id)}
+                      onSelectItem={(itemId) => onSelectItem(itemId, columnType)}
+                      blockBackgroundColor={blockColorMap.get(item.id)}
+                      onMoveUp={onMoveItemUp ? () => onMoveItemUp(item.id, columnType) : undefined}
+                      onMoveDown={onMoveItemDown ? () => onMoveItemDown(item.id, columnType) : undefined}
+                      canMoveUp={globalIndex > 0}
+                      canMoveDown={globalIndex < items.length - 1}
+                      isDuplicateCircle={duplicateCircleItemIds.has(item.id)}
+                      isSearchMatch={highlightedItemId === item.id}
+                      layoutMode={layoutMode}
+                      hallIndex={hallIndex}
+                      priorityLevel={group.priority}
+                    />
+
+                    {activeDropTarget?.id === item.id && activeDropTarget.position === 'bottom' && (
+                      <div className="absolute -bottom-3 left-0 right-0 h-2 flex items-center justify-center z-30 pointer-events-none">
+                        <div className="w-full h-1.5 bg-blue-500 rounded-full shadow-sm ring-2 ring-white dark:ring-slate-800 transform scale-x-95 transition-transform duration-75" />
+                        <div className="absolute w-4 h-4 bg-blue-500 rounded-full -left-1 ring-2 ring-white dark:ring-slate-800" />
+                        <div className="absolute w-4 h-4 bg-blue-500 rounded-full -right-1 ring-2 ring-white dark:ring-slate-800" />
+                      </div>
+                    )}
+
+                    {/* 範囲選択表示とチェーン選択UI（グループ内のみ） */}
+                    {isInRange && onToggleRangeSelection && (
+                      <div 
+                        className={`absolute top-0 bottom-0 z-40 ${
+                          columnType === 'candidate' ? 'left-0' : 'right-0'
+                        } cursor-pointer ${
+                          groupRangeInfo!.onlyStartEndSelected ? 'opacity-50 hover:opacity-100' : 'opacity-100'
+                        }`}
+                        style={{ width: '40px' }}
+                        onClick={() => onToggleRangeSelection(columnType!)}
+                      >
+                        <svg
+                          className="absolute w-full h-full"
+                          style={{
+                            [columnType === 'candidate' ? 'left' : 'right']: '-42px',
+                          }}
+                          preserveAspectRatio="none"
+                        >
+                          <defs>
+                            <linearGradient id={`chainMetal-group-${item.id}`} x1="0%" y1="0%" x2="100%" y2="0%">
+                              <stop offset="0%" stopColor="#9CA3AF" />
+                              <stop offset="50%" stopColor="#D1D5DB" />
+                              <stop offset="100%" stopColor="#9CA3AF" />
+                            </linearGradient>
+                            <pattern id={`chainPattern-group-${item.id}`} x="0" y="0" width="40" height="20" patternUnits="userSpaceOnUse">
+                               <rect x="14" y="-2" width="12" height="18" rx="6" fill="none" stroke={`url(#chainMetal-group-${item.id})`} strokeWidth="3" />
+                               <rect x="17" y="13" width="6" height="8" rx="2" fill={`url(#chainMetal-group-${item.id})`} stroke="#4B5563" strokeWidth="0.5" />
+                            </pattern>
+                          </defs>
+                          
+                          {isStart && (
+                            <rect x="0" y="50%" width="40" height="50%" fill={`url(#chainPattern-group-${item.id})`} />
+                          )}
+                          {isEnd && (
+                            <rect x="0" y="0" width="40" height="50%" fill={`url(#chainPattern-group-${item.id})`} />
+                          )}
+                          {isMiddle && (
+                            <rect x="0" y="0" width="40" height="100%" fill={`url(#chainPattern-group-${item.id})`} />
+                          )}
+                          
+                          {/* 端点のリング */}
+                          {isStart && (
+                            <ellipse 
+                              cx="20" cy="100%" rx="10" ry="5"
+                              fill="none"
+                              stroke={`url(#chainMetal-group-${item.id})`} 
+                              strokeWidth="3"
+                            />
+                          )}
+                          {isEnd && (
+                            <ellipse 
+                              cx="20" cy="0" rx="10" ry="5"
+                              fill="none"
+                              stroke={`url(#chainMetal-group-${item.id})`} 
+                              strokeWidth="3"
+                            />
+                          )}
+                          
+                          {/* 中心の丸 */}
+                          {isStart && <circle cx="20" cy="100%" r="4" fill={`url(#chainMetal-group-${item.id})`} stroke="#4B5563" strokeWidth="0.5" />}
+                          {isEnd && <circle cx="20" cy="0" r="4" fill={`url(#chainMetal-group-${item.id})`} stroke="#4B5563" strokeWidth="0.5" />}
+                        </svg>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );})}
+      </div>
+    );
+  }
+
+  // 通常表示（既存のコード）
+
   return (
     <div 
       ref={containerRef}
@@ -306,7 +743,7 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
             className="transition-opacity duration-200 relative"
             data-is-selected={selectedItemIds.has(item.id)}
         >
-            {activeDropTarget && activeDropTarget.id === item.id && activeDropTarget.position === 'top' && (
+            {activeDropTarget?.id === item.id && activeDropTarget.position === 'top' && (
                 <div className="absolute -top-3 left-0 right-0 h-2 flex items-center justify-center z-30 pointer-events-none">
                     <div className="w-full h-1.5 bg-blue-500 rounded-full shadow-sm ring-2 ring-white dark:ring-slate-800 transform scale-x-95 transition-transform duration-75" />
                     <div className="absolute w-4 h-4 bg-blue-500 rounded-full -left-1 ring-2 ring-white dark:ring-slate-800" />
@@ -329,9 +766,10 @@ const ShoppingList: React.FC<ShoppingListProps> = ({
               canMoveDown={index < items.length - 1}
               isDuplicateCircle={duplicateCircleItemIds.has(item.id)}
               isSearchMatch={highlightedItemId === item.id}
+              layoutMode={layoutMode}
             />
 
-            {activeDropTarget && activeDropTarget.id === item.id && activeDropTarget.position === 'bottom' && (
+            {activeDropTarget?.id === item.id && activeDropTarget.position === 'bottom' && (
                 <div className="absolute -bottom-3 left-0 right-0 h-2 flex items-center justify-center z-30 pointer-events-none">
                     <div className="w-full h-1.5 bg-blue-500 rounded-full shadow-sm ring-2 ring-white dark:ring-slate-800 transform scale-x-95 transition-transform duration-75" />
                     <div className="absolute w-4 h-4 bg-blue-500 rounded-full -left-1 ring-2 ring-white dark:ring-slate-800" />

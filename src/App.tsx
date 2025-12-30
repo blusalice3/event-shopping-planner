@@ -1,6 +1,5 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { ShoppingItem, PurchaseStatus, EventMetadata, ViewMode, DayModeState, ExecuteModeItems, EventMapData } from './types';
-import { readMapDataFromXlsx } from './utils/xlsxReader';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { ShoppingItem, PurchaseStatus, EventMetadata, ViewMode, DayModeState, ExecuteModeItems, MapDataStore, RouteSettingsStore, ExportOptions, BlockDefinition, HallDefinition, HallRouteSettings, HallDefinitionsStore, HallRouteSettingsStore } from './types';
 import ImportScreen from './components/ImportScreen';
 import ShoppingList from './components/ShoppingList';
 import SummaryBar from './components/SummaryBar';
@@ -11,11 +10,16 @@ import BulkActionControls from './components/BulkActionControls';
 import UpdateConfirmationModal from './components/UpdateConfirmationModal';
 import UrlUpdateDialog from './components/UrlUpdateDialog';
 import EventRenameDialog from './components/EventRenameDialog';
+import ExportOptionsDialog from './components/ExportOptionsDialog';
 import SortAscendingIcon from './components/icons/SortAscendingIcon';
 import SortDescendingIcon from './components/icons/SortDescendingIcon';
 import SearchBar from './components/SearchBar';
-import MapView from './components/MapView';
+import { MapView, BlockDefinitionPanel, HallDefinitionPanel, isPointInPolygon } from './components/map';
+import VisitListPanel from './components/VisitListPanel';
 import { getItemKey, getItemKeyWithoutTitle, insertItemSorted } from './utils/itemComparison';
+import { parseMapFile } from './utils/xlsxMapParser';
+import { db } from './utils/indexedDB';
+import { exportToXlsx, importFromXlsx, downloadBlob } from './utils/exportImport';
 
 type ActiveTab = 'eventList' | 'import' | string; // string部分は動的な参加日（例: '1日目', '2日目', '3日目'など）
 type SortState = 'Manual' | 'Postpone' | 'Late' | 'Absent' | 'SoldOut' | 'Purchased';
@@ -54,7 +58,6 @@ const App: React.FC = () => {
   const [eventMetadata, setEventMetadata] = useState<Record<string, EventMetadata>>({});
   const [executeModeItems, setExecuteModeItems] = useState<Record<string, ExecuteModeItems>>({});
   const [dayModes, setDayModes] = useState<Record<string, DayModeState>>({});
-  const [eventMapData, setEventMapData] = useState<EventMapData>({});
   
   const [activeEventName, setActiveEventName] = useState<string | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
@@ -89,65 +92,227 @@ const App: React.FC = () => {
   const [currentSearchIndex, setCurrentSearchIndex] = useState(-1);
   const [highlightedItemId, setHighlightedItemId] = useState<string | null>(null);
 
+  // レイアウトモード状態
+  const [layoutMode, setLayoutMode] = useState<'pc' | 'smartphone'>('pc');
+
+  // マップ機能の状態
+  const [mapData, setMapData] = useState<MapDataStore>({});
+  const [routeSettings, setRouteSettings] = useState<RouteSettingsStore>({});
+  const [hallDefinitions, setHallDefinitions] = useState<HallDefinitionsStore>({});
+  const [hallRouteSettings, setHallRouteSettings] = useState<HallRouteSettingsStore>({});
+  const [showExportOptions, setShowExportOptions] = useState(false);
+  const [exportEventName, setExportEventName] = useState<string | null>(null);
+  const mapFileInputRef = useRef<HTMLInputElement>(null);
+  const exportFileInputRef = useRef<HTMLInputElement>(null);
+  
+  // 保存フラグ（データ変更時のみ保存）
+  const isSavingRef = useRef(false);
+
+  // IndexedDBからデータを読み込み
   useEffect(() => {
-    try {
-      const storedLists = localStorage.getItem('eventShoppingLists');
-      const storedMetadata = localStorage.getItem('eventMetadata');
-      const storedExecuteItems = localStorage.getItem('executeModeItems');
-      const storedDayModes = localStorage.getItem('dayModes');
-      const storedMapData = localStorage.getItem('eventMapData');
-      
-      if (storedLists) {
-        const parsedLists = JSON.parse(storedLists);
+    const loadData = async () => {
+      try {
+        // localStorageからの移行を試みる
+        await db.migrateFromLocalStorage();
+        
+        // IndexedDBからデータを読み込み
+        const [
+          loadedEventLists,
+          loadedMetadata,
+          loadedExecuteItems,
+          loadedDayModes,
+          loadedMapData,
+          loadedRouteSettings,
+          loadedHallDefinitions,
+          loadedHallRouteSettings,
+        ] = await Promise.all([
+          db.loadEventLists(),
+          db.loadEventMetadata(),
+          db.loadExecuteModeItems(),
+          db.loadDayModes(),
+          db.loadMapData(),
+          db.loadRouteSettings(),
+          db.loadHallDefinitions(),
+          db.loadHallRouteSettings(),
+        ]);
+        
         // 既存データの互換性: quantityフィールドがない場合は1を設定
         const migratedLists: Record<string, ShoppingItem[]> = {};
-        Object.keys(parsedLists).forEach(eventName => {
-          migratedLists[eventName] = parsedLists[eventName].map((item: ShoppingItem) => ({
+        Object.keys(loadedEventLists).forEach(eventName => {
+          migratedLists[eventName] = (loadedEventLists[eventName] as ShoppingItem[]).map((item: ShoppingItem) => ({
             ...item,
             quantity: item.quantity ?? 1,
           }));
         });
+        
         setEventLists(migratedLists);
+        setEventMetadata(loadedMetadata as Record<string, EventMetadata>);
+        setExecuteModeItems(loadedExecuteItems);
+        setDayModes(loadedDayModes as Record<string, DayModeState>);
+        setMapData(loadedMapData as MapDataStore);
+        setRouteSettings(loadedRouteSettings as RouteSettingsStore);
+        setHallDefinitions(loadedHallDefinitions as HallDefinitionsStore);
+        setHallRouteSettings(loadedHallRouteSettings as HallRouteSettingsStore);
+        
+        console.log('Data loaded from IndexedDB');
+      } catch (error) {
+        console.error('Failed to load data from IndexedDB:', error);
       }
-      if (storedMetadata) {
-        setEventMetadata(JSON.parse(storedMetadata));
-      }
-      if (storedExecuteItems) {
-        setExecuteModeItems(JSON.parse(storedExecuteItems));
-      }
-      if (storedDayModes) {
-        setDayModes(JSON.parse(storedDayModes));
-      }
-      if (storedMapData) {
-        setEventMapData(JSON.parse(storedMapData));
-      }
-    } catch (error) {
-      console.error("Failed to load data from localStorage", error);
-    }
-    setIsInitialized(true);
+      setIsInitialized(true);
+    };
+    
+    loadData();
   }, []);
 
+  // IndexedDBへデータを保存（デバウンス付き）
   useEffect(() => {
-    if (isInitialized) {
+    if (!isInitialized || isSavingRef.current) return;
+    
+    const saveData = async () => {
+      isSavingRef.current = true;
       try {
-        localStorage.setItem('eventShoppingLists', JSON.stringify(eventLists));
-        localStorage.setItem('eventMetadata', JSON.stringify(eventMetadata));
-        localStorage.setItem('executeModeItems', JSON.stringify(executeModeItems));
-        localStorage.setItem('dayModes', JSON.stringify(dayModes));
-        localStorage.setItem('eventMapData', JSON.stringify(eventMapData));
+        await Promise.all([
+          db.saveEventLists(eventLists),
+          db.saveEventMetadata(eventMetadata),
+          db.saveExecuteModeItems(executeModeItems),
+          db.saveDayModes(dayModes),
+          db.saveMapData(mapData),
+          db.saveRouteSettings(routeSettings),
+          db.saveHallDefinitions(hallDefinitions),
+          db.saveHallRouteSettings(hallRouteSettings),
+        ]);
+        console.log('Data saved to IndexedDB');
       } catch (error) {
-        console.error("Failed to save data to localStorage", error);
+        console.error('Failed to save data to IndexedDB:', error);
+        alert('データの保存に失敗しました。ストレージ容量を確認してください。');
+      } finally {
+        isSavingRef.current = false;
       }
-    }
-  }, [eventLists, eventMetadata, executeModeItems, dayModes, eventMapData, isInitialized]);
+    };
+    
+    // デバウンス: 500ms後に保存
+    const timeoutId = setTimeout(saveData, 500);
+    return () => clearTimeout(timeoutId);
+  }, [eventLists, eventMetadata, executeModeItems, dayModes, mapData, routeSettings, hallDefinitions, hallRouteSettings, isInitialized]);
 
   const items = useMemo(() => activeEventName ? eventLists[activeEventName] || [] : [], [activeEventName, eventLists]);
   
   // 現在のイベントの参加日リストを取得
   const eventDates = useMemo(() => extractEventDates(items), [items]);
   
+  // 現在のイベントのマップタブリストを取得
+  const mapTabs = useMemo(() => {
+    if (!activeEventName || !mapData[activeEventName]) return [];
+    return Object.keys(mapData[activeEventName]).sort((a, b) => {
+      const numA = parseInt(a.match(/\d+/)?.[0] || '0', 10);
+      const numB = parseInt(b.match(/\d+/)?.[0] || '0', 10);
+      return numA - numB;
+    });
+  }, [activeEventName, mapData]);
+  
+  // マップタブかどうかを判定
+  const isMapTab = useMemo(() => {
+    return activeTab.endsWith('マップ');
+  }, [activeTab]);
+  
+  // 現在のマップデータを取得
+  const currentMapData = useMemo(() => {
+    if (!activeEventName || !isMapTab) return null;
+    return mapData[activeEventName]?.[activeTab] || null;
+  }, [activeEventName, activeTab, isMapTab, mapData]);
+
+  // 現在のホール定義を取得
+  const currentHalls = useMemo((): HallDefinition[] => {
+    if (!activeEventName || !isMapTab) return [];
+    return hallDefinitions[activeEventName]?.[activeTab] || [];
+  }, [activeEventName, activeTab, isMapTab, hallDefinitions]);
+
+  // 現在のホールルート設定を取得
+  const currentHallRouteSettings = useMemo((): HallRouteSettings => {
+    if (!activeEventName || !isMapTab) {
+      return { hallOrder: [], hallVisitLists: [] };
+    }
+    return hallRouteSettings[activeEventName]?.[activeTab] || { hallOrder: currentHalls.map(h => h.id), hallVisitLists: [] };
+  }, [activeEventName, activeTab, isMapTab, hallRouteSettings, currentHalls]);
+
+  // 日付タブに対応するマップタブ名を取得（例: "1日目" → "1日目マップ"）
+  const getMapTabForDate = useCallback((eventDate: string): string => {
+    return `${eventDate}マップ`;
+  }, []);
+
+  // 日付タブに対応するホール定義を取得
+  const getHallsForDate = useCallback((eventDate: string): HallDefinition[] => {
+    if (!activeEventName) return [];
+    const mapTab = getMapTabForDate(eventDate);
+    return hallDefinitions[activeEventName]?.[mapTab] || [];
+  }, [activeEventName, hallDefinitions, getMapTabForDate]);
+
+  // 日付タブに対応するマップデータを取得
+  const getMapDataForDate = useCallback((eventDate: string) => {
+    if (!activeEventName) return null;
+    const mapTab = getMapTabForDate(eventDate);
+    return mapData[activeEventName]?.[mapTab] || null;
+  }, [activeEventName, mapData, getMapTabForDate]);
+
+  // 日付タブに対応するホール順序を取得
+  const getHallOrderForDate = useCallback((eventDate: string): string[] => {
+    if (!activeEventName) return [];
+    const mapTab = getMapTabForDate(eventDate);
+    const halls = hallDefinitions[activeEventName]?.[mapTab] || [];
+    const routeSettings = hallRouteSettings[activeEventName]?.[mapTab];
+    
+    if (routeSettings?.hallOrder && routeSettings.hallOrder.length > 0) {
+      return routeSettings.hallOrder;
+    }
+    
+    // デフォルトはホール定義順
+    return halls.map(h => h.id);
+  }, [activeEventName, hallDefinitions, hallRouteSettings, getMapTabForDate]);
+
+  // アイテムがどのホールに属するかを判定
+  const getItemHallId = useCallback((item: ShoppingItem, eventDate: string): string | null => {
+    const halls = getHallsForDate(eventDate);
+    const mapDataForDate = getMapDataForDate(eventDate);
+    if (!halls.length || !mapDataForDate) return null;
+
+    // ブロックの中心点を取得
+    const block = mapDataForDate.blocks.find(b => b.name === item.block);
+    if (!block) return null;
+
+    const centerRow = (block.startRow + block.endRow) / 2;
+    const centerCol = (block.startCol + block.endCol) / 2;
+
+    // どのホールに属するか判定
+    for (const hall of halls) {
+      if (hall.vertices.length >= 4 && isPointInPolygon(centerRow, centerCol, hall.vertices)) {
+        return hall.id;
+      }
+    }
+    return null;
+  }, [getHallsForDate, getMapDataForDate]);
+
+  // 2つのアイテムが同じホールに属するかを判定
+  const areItemsInSameHall = useCallback((itemId1: string, itemId2: string, eventDate: string): boolean => {
+    const item1 = items.find(i => i.id === itemId1);
+    const item2 = items.find(i => i.id === itemId2);
+    if (!item1 || !item2) return true; // アイテムが見つからない場合は制限なし
+
+    const halls = getHallsForDate(eventDate);
+    if (!halls.length) return true; // ホール定義がない場合は制限なし
+
+    const hallId1 = getItemHallId(item1, eventDate);
+    const hallId2 = getItemHallId(item2, eventDate);
+
+    // どちらかがホールに属していない場合は制限なし
+    if (hallId1 === null || hallId2 === null) return true;
+
+    return hallId1 === hallId2;
+  }, [items, getHallsForDate, getItemHallId]);
+  
   const currentMode = useMemo(() => {
     if (!activeEventName) return 'execute';
+    // マップタブの場合は編集モードを返す
+    if (isMapTab) return 'edit';
     const modes = dayModes[activeEventName];
     if (!modes) return 'edit';
     // activeTabが参加日（'1日目', '2日目'など）の場合
@@ -155,7 +320,7 @@ const App: React.FC = () => {
       return modes[activeTab] || 'edit';
     }
     return 'edit';
-  }, [activeEventName, dayModes, activeTab, eventDates]);
+  }, [activeEventName, dayModes, activeTab, eventDates, isMapTab]);
 
   const handleBulkAdd = useCallback((eventName: string, newItemsData: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[], metadata?: { url?: string; sheetName?: string; layoutInfo?: Array<{ itemKey: string, eventDate: string, columnType: 'execute' | 'candidate', order: number }> }) => {
     const newItems: ShoppingItem[] = newItemsData.map(itemData => ({
@@ -412,7 +577,7 @@ const App: React.FC = () => {
           // executeModeItemsから削除
           setExecuteModeItems(prevExecute => {
             const eventItems = prevExecute[activeEventName] || {};
-            const dayItems = (eventItems[currentEventDate] || []).filter((id: string) => !itemIdsToMove.includes(id));
+            const dayItems = (eventItems[currentEventDate] || []).filter(id => !itemIdsToMove.includes(id));
             return {
               ...prevExecute,
               [activeEventName]: { ...eventItems, [currentEventDate]: dayItems }
@@ -632,6 +797,12 @@ const App: React.FC = () => {
         const currentIndex = dayItems.findIndex(id => id === itemId);
         
         if (currentIndex <= 0) return prev; // 既に先頭または見つからない
+
+        // ホール間移動制限チェック
+        const targetId = dayItems[currentIndex - 1];
+        if (!areItemsInSameHall(itemId, targetId, currentEventDate)) {
+          return prev; // 異なるホールなので移動不可
+        }
         
         // 複数選択時は選択されたアイテムすべてを移動
         if (selectedItemIds.has(itemId)) {
@@ -641,6 +812,11 @@ const App: React.FC = () => {
           // 選択されたアイテムの最初の位置を基準に移動
           const firstSelectedIndex = dayItems.findIndex(id => selectedItemIds.has(id));
           if (firstSelectedIndex > 0) {
+            // ホール間移動制限チェック（選択グループ全体）
+            const targetIdForGroup = dayItems[firstSelectedIndex - 1];
+            if (!areItemsInSameHall(selectedIds[0], targetIdForGroup, currentEventDate)) {
+              return prev; // 異なるホールなので移動不可
+            }
             const newTargetIndex = firstSelectedIndex - 1;
             listWithoutSelection.splice(newTargetIndex, 0, ...selectedIds);
             return {
@@ -750,7 +926,7 @@ const App: React.FC = () => {
         }
       });
     }
-  }, [activeEventName, selectedItemIds, activeTab, dayModes, executeModeItems, eventDates]);
+  }, [activeEventName, selectedItemIds, activeTab, dayModes, executeModeItems, eventDates, areItemsInSameHall]);
 
 const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute' | 'candidate') => {
     if (!activeEventName) return;
@@ -769,6 +945,12 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
         
         if (currentIndex < 0 || currentIndex >= dayItems.length - 1) return prev; // 既に末尾または見つからない
         
+        // ホール間移動制限チェック
+        const targetId = dayItems[currentIndex + 1];
+        if (!areItemsInSameHall(itemId, targetId, currentEventDate)) {
+          return prev; // 異なるホールなので移動不可
+        }
+        
         // 複数選択時は選択されたアイテムすべてを移動
         if (selectedItemIds.has(itemId)) {
           const selectedIds = dayItems.filter(id => selectedItemIds.has(id));
@@ -784,6 +966,11 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
           if (lastSelectedIndex >= 0 && lastSelectedIndex < dayItems.length - 1) {
             // 飛び越える対象のアイテム（選択範囲の直後のアイテム）
             const jumpOverItemId = dayItems[lastSelectedIndex + 1];
+            
+            // ホール間移動制限チェック（選択グループ全体）
+            if (!areItemsInSameHall(selectedIds[selectedIds.length - 1], jumpOverItemId, currentEventDate)) {
+              return prev; // 異なるホールなので移動不可
+            }
             
             // 非選択リスト内でのそのアイテムの位置
             const targetIndexInListWithout = listWithoutSelection.findIndex(id => id === jumpOverItemId);
@@ -919,7 +1106,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
         }
       });
     }
-  }, [activeEventName, selectedItemIds, activeTab, dayModes, executeModeItems, eventDates]);
+  }, [activeEventName, selectedItemIds, activeTab, dayModes, executeModeItems, eventDates, areItemsInSameHall]);
 
   const handleMoveToExecuteColumn = useCallback((itemIds: string[]) => {
     if (!activeEventName) return;
@@ -994,7 +1181,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
     
     setExecuteModeItems(prev => {
       const eventItems = prev[activeEventName] || {};
-      const currentDayItems = (eventItems[currentEventDate] || []).filter((id: string) => !itemIds.includes(id));
+      const currentDayItems = (eventItems[currentEventDate] || []).filter(id => !itemIds.includes(id));
       
       return {
         ...prev,
@@ -1061,11 +1248,6 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
         delete newModes[eventName];
         return newModes;
     });
-    setEventMapData((prev: EventMapData) => {
-        const newMapData = {...prev};
-        delete newMapData[eventName];
-        return newMapData;
-    });
     if (activeEventName === eventName) {
         setActiveEventName(null);
         setActiveTab('eventList');
@@ -1127,13 +1309,44 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       return newItems;
     });
 
-    setEventMapData((prev: EventMapData) => {
-      const newMapData = { ...prev };
-      if (newMapData[eventToRename]) {
-        newMapData[newName] = newMapData[eventToRename];
-        delete newMapData[eventToRename];
+    // マップデータの名前変更
+    setMapData(prev => {
+      const newData = { ...prev };
+      if (newData[eventToRename]) {
+        newData[newName] = newData[eventToRename];
+        delete newData[eventToRename];
       }
-      return newMapData;
+      return newData;
+    });
+
+    // ルート設定の名前変更
+    setRouteSettings(prev => {
+      const newSettings = { ...prev };
+      if (newSettings[eventToRename]) {
+        newSettings[newName] = newSettings[eventToRename];
+        delete newSettings[eventToRename];
+      }
+      return newSettings;
+    });
+
+    // ホール定義の名前変更
+    setHallDefinitions(prev => {
+      const newDefs = { ...prev };
+      if (newDefs[eventToRename]) {
+        newDefs[newName] = newDefs[eventToRename];
+        delete newDefs[eventToRename];
+      }
+      return newDefs;
+    });
+
+    // ホールルート設定の名前変更
+    setHallRouteSettings(prev => {
+      const newSettings = { ...prev };
+      if (newSettings[eventToRename]) {
+        newSettings[newName] = newSettings[eventToRename];
+        delete newSettings[eventToRename];
+      }
+      return newSettings;
     });
 
     if (activeEventName === eventToRename) {
@@ -1143,33 +1356,6 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
     setShowRenameDialog(false);
     setEventToRename(null);
   }, [eventToRename, eventLists, activeEventName]);
-
-  const handleImportMap = useCallback((eventName: string) => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.xlsx,.xls';
-    input.onchange = async (e) => {
-      const file = (e.target as HTMLInputElement).files?.[0];
-      if (!file) return;
-
-      try {
-        const mapDataMap = await readMapDataFromXlsx(file);
-        const mapData: Record<string, any[][]> = {};
-        mapDataMap.forEach((data, key) => {
-          mapData[key] = data;
-        });
-        setEventMapData((prev: EventMapData) => ({
-          ...prev,
-          [eventName]: mapData,
-        }));
-        alert('マップデータの取り込みが完了しました。');
-      } catch (error) {
-        console.error('マップデータの読み込みに失敗しました:', error);
-        alert('マップデータの読み込みに失敗しました。ファイル形式を確認してください。');
-      }
-    };
-    input.click();
-  }, []);
 
   const handleSortToggle = () => {
     setSelectedItemIds(new Set());
@@ -1294,7 +1480,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       
       const updatedEventItems: ExecuteModeItems = {};
       Object.keys(eventItems).forEach(eventDate => {
-        updatedEventItems[eventDate] = eventItems[eventDate].filter((id: string) => id !== deletedId);
+        updatedEventItems[eventDate] = eventItems[eventDate].filter(id => id !== deletedId);
       });
       
       return {
@@ -1333,7 +1519,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       if (currentColumnType === 'execute') {
         const executeIds = executeModeItems[activeEventName]?.[currentEventDate] || [];
         const itemsMap = new Map(items.map(item => [item.id, item]));
-        currentItems = executeIds.map((id: string) => itemsMap.get(id)).filter(Boolean) as ShoppingItem[];
+        currentItems = executeIds.map(id => itemsMap.get(id)).filter(Boolean) as ShoppingItem[];
       } else {
         const executeIds = new Set(executeModeItems[activeEventName]?.[currentEventDate] || []);
         let filtered = items.filter(item => 
@@ -1508,7 +1694,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
     if (columnType === 'execute') {
       const executeIds = executeModeItems[activeEventName]?.[currentEventDate] || [];
       const itemsMap = new Map(items.map(item => [item.id, item]));
-      currentItems = executeIds.map((id: string) => itemsMap.get(id)).filter(Boolean) as ShoppingItem[];
+      currentItems = executeIds.map(id => itemsMap.get(id)).filter(Boolean) as ShoppingItem[];
     } else {
       const executeIds = new Set(executeModeItems[activeEventName]?.[currentEventDate] || []);
       let filtered = items.filter(item => 
@@ -1521,6 +1707,112 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       currentItems = filtered;
     }
     
+    // ホール定義とマップデータを取得してグループ化
+    const halls = getHallsForDate(currentEventDate);
+    const currentMapData = getMapDataForDate(currentEventDate);
+    
+    // グループ化が有効な場合、同一グループ内のアイテムのみを対象にする
+    if (halls.length > 0 && currentMapData) {
+      // アイテムのホールIDを取得するヘルパー
+      const getHallIdForItem = (item: ShoppingItem): string | null => {
+        const block = currentMapData.blocks.find(b => b.name === item.block);
+        if (!block) return null;
+        
+        const numMatch = item.number?.match(/\d+/);
+        if (!numMatch) return null;
+        const num = parseInt(numMatch[0], 10);
+        
+        const cell = block.numberCells.find((nc: { row: number; col: number; value: number }) => nc.value === num);
+        if (!cell) return null;
+        
+        // 多角形内判定
+        const isPointInPoly = (row: number, col: number, vertices: { row: number; col: number }[]): boolean => {
+          if (vertices.length < 3) return false;
+          let inside = false;
+          for (let i = 0, j = vertices.length - 1; i < vertices.length; j = i++) {
+            const xi = vertices[i].col, yi = vertices[i].row;
+            const xj = vertices[j].col, yj = vertices[j].row;
+            if (((yi > row) !== (yj > row)) && (col < (xj - xi) * (row - yi) / (yj - yi) + xi)) {
+              inside = !inside;
+            }
+          }
+          return inside;
+        };
+        
+        for (const hall of halls) {
+          for (const vertex of hall.vertices) {
+            if (vertex.row === cell.row && vertex.col === cell.col) {
+              return hall.id;
+            }
+          }
+          if (isPointInPoly(cell.row, cell.col, hall.vertices)) {
+            return hall.id;
+          }
+        }
+        return null;
+      };
+      
+      // グループIDを生成するヘルパー
+      const buildGroupId = (hallId: string | null, priority: 'none' | 'priority' | 'highest'): string | null => {
+        if (hallId === null) {
+          if (priority === 'highest') return 'undefined:highest';
+          if (priority === 'priority') return 'undefined:priority';
+          return null;
+        }
+        if (priority === 'highest') return `${hallId}:highest`;
+        if (priority === 'priority') return `${hallId}:priority`;
+        return hallId;
+      };
+      
+      const getItemGroupId = (item: ShoppingItem): string | null => {
+        const hallId = getHallIdForItem(item);
+        const priority = item.priorityLevel || 'none';
+        return buildGroupId(hallId, priority);
+      };
+      
+      // rangeStartとrangeEndのグループIDを確認
+      const startItem = currentItems.find(item => item.id === rangeStart.itemId);
+      const endItem = currentItems.find(item => item.id === rangeEnd.itemId);
+      
+      if (!startItem || !endItem) return;
+      
+      const startGroupId = getItemGroupId(startItem);
+      const endGroupId = getItemGroupId(endItem);
+      
+      // 異なるグループの場合は何もしない
+      if (startGroupId !== endGroupId) {
+        return;
+      }
+      
+      // 同じグループ内のアイテムのみを対象にする
+      const groupItems = currentItems.filter(item => getItemGroupId(item) === startGroupId);
+      
+      const startIndex = groupItems.findIndex(item => item.id === rangeStart.itemId);
+      const endIndex = groupItems.findIndex(item => item.id === rangeEnd.itemId);
+      
+      if (startIndex === -1 || endIndex === -1) return;
+      
+      const minIndex = Math.min(startIndex, endIndex);
+      const maxIndex = Math.max(startIndex, endIndex);
+      const rangeItems = groupItems.slice(minIndex, maxIndex + 1);
+      
+      // 範囲内のアイテムが全てチェック済みかチェック
+      setSelectedItemIds(prev => {
+        const allSelected = rangeItems.every(item => prev.has(item.id));
+        const newSet = new Set(prev);
+        if (allSelected) {
+          rangeItems.forEach(item => newSet.delete(item.id));
+          setRangeStart(null);
+          setRangeEnd(null);
+        } else {
+          rangeItems.forEach(item => newSet.add(item.id));
+        }
+        return newSet;
+      });
+      return;
+    }
+    
+    // グループ化が無効な場合は従来のロジック
     const startIndex = currentItems.findIndex(item => item.id === rangeStart.itemId);
     const endIndex = currentItems.findIndex(item => item.id === rangeEnd.itemId);
     
@@ -1546,7 +1838,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       }
       return newSet;
     });
-  }, [rangeStart, rangeEnd, activeTab, activeEventName, eventDates, executeModeItems, items, selectedBlockFilters]);
+  }, [rangeStart, rangeEnd, activeTab, activeEventName, eventDates, executeModeItems, items, selectedBlockFilters, getHallsForDate, getMapDataForDate]);
 
   const handleBulkSort = useCallback((direction: BulkSortDirection) => {
     if (!activeEventName || selectedItemIds.size === 0) return;
@@ -1655,114 +1947,168 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
     }
   }, [activeEventName, selectedItemIds, items, activeTab, dayModes, executeModeItems, eventDates]);
 
+  // エクスポートオプションダイアログを表示
   const handleExportEvent = useCallback((eventName: string) => {
     const itemsToExport = eventLists[eventName];
     if (!itemsToExport || itemsToExport.length === 0) {
       alert('エクスポートするアイテムがありません。');
       return;
     }
+    setExportEventName(eventName);
+    setShowExportOptions(true);
+  }, [eventLists]);
 
-    const statusLabels: Record<PurchaseStatus, string> = {
-      None: '未購入',
-      Purchased: '購入済',
-      SoldOut: '売切',
-      Absent: '欠席',
-      Postpone: '後回し',
-      Late: '遅参',
-    };
-
-    const escapeCsvCell = (cellData: string | number) => {
-      const stringData = String(cellData);
-      if (stringData.includes(',') || stringData.includes('"') || stringData.includes('\n')) {
-        return `"${stringData.replace(/"/g, '""')}"`;
-      }
-      return stringData;
-    };
-
-    const csvRows: string[] = [];
-
-    // ヘッダー行を最初に出力
-    const headers = ['サークル名', '参加日', 'ブロック', 'ナンバー', 'タイトル', '頒布価格', '数量', '購入状態', '備考', '列の種類', '列内順番', 'URL'];
-    csvRows.push(headers.join(','));
-
-    // メタデータ行: スプレッドシートURL（コメント行として最後に出力）
-    const metadata = eventMetadata[eventName];
-    if (metadata?.spreadsheetUrl) {
-      csvRows.push(`#METADATA,spreadsheetUrl,${escapeCsvCell(metadata.spreadsheetUrl)}`);
+  // 実際のエクスポート処理（xlsx形式）
+  const handleConfirmExport = useCallback(async (options: ExportOptions) => {
+    if (!exportEventName) return;
+    
+    const itemsToExport = eventLists[exportEventName];
+    if (!itemsToExport || itemsToExport.length === 0) {
+      return;
     }
 
-    // 各参加日ごとに配置情報を保持してエクスポート
-    const eventDatesForExport = extractEventDates(itemsToExport);
-    const itemsMap = new Map(itemsToExport.map(item => [item.id, item]));
-    
-    eventDatesForExport.forEach(eventDate => {
-      const executeIds = executeModeItems[eventName]?.[eventDate] || [];
-      const executeIdsSet = new Set(executeIds);
-      
-      // その参加日のアイテムを取得
-      const dayItems = itemsToExport.filter(item => item.eventDate === eventDate);
-      
-      // 実行列のアイテム（順序を保持）
-      const executeItems: ShoppingItem[] = [];
-      executeIds.forEach((id: string) => {
-        const item = itemsMap.get(id);
-        if (item) executeItems.push(item);
-      });
-      
-      // 候補リストのアイテム（元の順序を保持）
-      const candidateItems = dayItems.filter(item => !executeIdsSet.has(item.id));
-      
-      // 実行列のアイテムをエクスポート
-      executeItems.forEach((item, index) => {
-        const row = [
-          escapeCsvCell(item.circle),
-          escapeCsvCell(item.eventDate),
-          escapeCsvCell(item.block),
-          escapeCsvCell(item.number),
-          escapeCsvCell(item.title),
-          escapeCsvCell(item.price === null ? '' : item.price),
-          escapeCsvCell(item.quantity || 1),
-          escapeCsvCell(statusLabels[item.purchaseStatus] || item.purchaseStatus),
-          escapeCsvCell(item.remarks),
-          escapeCsvCell('実行列'),
-          escapeCsvCell(index + 1),
-          escapeCsvCell(item.url || ''),
-        ];
-        csvRows.push(row.join(','));
-      });
-      
-      // 候補リストのアイテムをエクスポート
-      candidateItems.forEach((item, index) => {
-        const row = [
-          escapeCsvCell(item.circle),
-          escapeCsvCell(item.eventDate),
-          escapeCsvCell(item.block),
-          escapeCsvCell(item.number),
-          escapeCsvCell(item.title),
-          escapeCsvCell(item.price === null ? '' : item.price),
-          escapeCsvCell(item.quantity || 1),
-          escapeCsvCell(statusLabels[item.purchaseStatus] || item.purchaseStatus),
-          escapeCsvCell(item.remarks),
-          escapeCsvCell('候補リスト'),
-          escapeCsvCell(index + 1),
-          escapeCsvCell(item.url || ''),
-        ];
-        csvRows.push(row.join(','));
-      });
-    });
+    try {
+      const blob = await exportToXlsx(
+        exportEventName,
+        itemsToExport,
+        options,
+        {
+          metadata: eventMetadata[exportEventName],
+          executeModeItems,
+          dayModes,
+          mapData,
+          routeSettings,
+          hallDefinitions,
+          hallRouteSettings,
+        }
+      );
 
-    const csvString = csvRows.join('\n');
-    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
-    const blob = new Blob([bom, csvString], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.setAttribute('href', url);
-    link.setAttribute('download', `${eventName}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  }, [eventLists, executeModeItems, eventMetadata]);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '').slice(0, 15);
+      const suffix = options.format === 'full' ? 'full' : 'simple';
+      const filename = `${exportEventName}_${timestamp}_${suffix}.xlsx`;
+      
+      downloadBlob(blob, filename);
+    } catch (error) {
+      console.error('Export error:', error);
+      alert('エクスポートに失敗しました。');
+    }
+    
+    setExportEventName(null);
+  }, [eventLists, executeModeItems, eventMetadata, dayModes, mapData, routeSettings, hallDefinitions, hallRouteSettings, exportEventName]);
+
+  // エクスポートファイルのインポート処理
+  const handleExportFileImport = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    
+    // input をリセット
+    e.target.value = '';
+    
+    try {
+      const result = await importFromXlsx(file);
+      
+      if (!result.success) {
+        alert(`インポートに失敗しました:\n${result.errors.join('\n')}`);
+        return;
+      }
+      
+      if (result.items.length === 0) {
+        alert('インポートするアイテムがありません。');
+        return;
+      }
+      
+      // イベント名の重複チェック
+      let eventName = result.eventName;
+      if (eventLists[eventName]) {
+        const overwrite = confirm(`「${eventName}」は既に存在します。上書きしますか？\n\nキャンセルを押すと新しい名前で保存します。`);
+        if (!overwrite) {
+          const newName = prompt('新しいイベント名を入力してください:', `${eventName}_imported`);
+          if (!newName) return;
+          eventName = newName;
+        }
+      }
+      
+      // アイテムを保存
+      setEventLists(prev => ({
+        ...prev,
+        [eventName]: result.items,
+      }));
+      
+      // メタデータを保存
+      if (result.metadata) {
+        setEventMetadata(prev => ({
+          ...prev,
+          [eventName]: result.metadata as EventMetadata,
+        }));
+      }
+      
+      // 配置情報を保存
+      if (result.layoutInfo) {
+        if (Object.keys(result.layoutInfo.executeModeItems).length > 0) {
+          setExecuteModeItems(prev => ({
+            ...prev,
+            [eventName]: result.layoutInfo!.executeModeItems,
+          }));
+        }
+        if (Object.keys(result.layoutInfo.dayModes).length > 0) {
+          setDayModes(prev => ({
+            ...prev,
+            [eventName]: result.layoutInfo!.dayModes as unknown as DayModeState,
+          }));
+        }
+      }
+      
+      // マップデータを保存
+      if (result.mapData && Object.keys(result.mapData).length > 0) {
+        setMapData(prev => ({
+          ...prev,
+          [eventName]: result.mapData as MapDataStore[string],
+        }));
+      }
+      
+      // ルート設定を保存
+      if (result.routeSettings && Object.keys(result.routeSettings).length > 0) {
+        setRouteSettings(prev => ({
+          ...prev,
+          [eventName]: result.routeSettings as RouteSettingsStore[string],
+        }));
+      }
+      
+      // ホール定義を保存
+      if (result.hallDefinitions && Object.keys(result.hallDefinitions).length > 0) {
+        setHallDefinitions(prev => ({
+          ...prev,
+          [eventName]: result.hallDefinitions as HallDefinitionsStore[string],
+        }));
+      }
+      
+      // ホールルート設定を保存
+      if (result.hallRouteSettings && Object.keys(result.hallRouteSettings).length > 0) {
+        setHallRouteSettings(prev => ({
+          ...prev,
+          [eventName]: result.hallRouteSettings as HallRouteSettingsStore[string],
+        }));
+      }
+      
+      // エラーがあれば表示
+      if (result.errors.length > 0) {
+        alert(`インポート完了（一部エラーあり）:\n${result.errors.join('\n')}`);
+      } else {
+        alert(`「${eventName}」をインポートしました。\n${result.items.length}件のアイテム`);
+      }
+      
+      // インポートしたイベントを選択
+      setActiveEventName(eventName);
+      const eventDates = extractEventDates(result.items);
+      if (eventDates.length > 0) {
+        setActiveTab(eventDates[0]);
+      }
+      
+    } catch (error) {
+      console.error('Import error:', error);
+      alert('インポートに失敗しました。ファイル形式を確認してください。');
+    }
+  }, [eventLists]);
 
   // アイテム更新機能
   const handleUpdateEvent = useCallback(async (eventName: string, urlOverride?: { url: string; sheetName: string }) => {
@@ -1991,7 +2337,8 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
           price: itemData.price,
           quantity: itemData.quantity ?? 1,
           remarks: itemData.remarks,
-          purchaseStatus: 'None' as PurchaseStatus
+          purchaseStatus: 'None' as PurchaseStatus,
+          ...(itemData.url ? { url: itemData.url } : {})
         };
         newItems = insertItemSorted(newItems, newItem);
         // 候補リストに追加（実行モード列には追加しない）
@@ -2009,7 +2356,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       const updatedEventItems: ExecuteModeItems = {};
       
       Object.keys(eventItems).forEach(eventDate => {
-        updatedEventItems[eventDate] = eventItems[eventDate].filter((id: string) => !deleteIds.has(id));
+        updatedEventItems[eventDate] = eventItems[eventDate].filter(id => !deleteIds.has(id));
       });
       
       return {
@@ -2031,6 +2378,255 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       setPendingUpdateEventName(null);
     }
   }, [pendingUpdateEventName, handleUpdateEvent]);
+
+  // マップデータ取り込み
+  const handleImportMapData = useCallback(async (eventName: string) => {
+    if (mapFileInputRef.current) {
+      mapFileInputRef.current.dataset.eventName = eventName;
+      mapFileInputRef.current.click();
+    }
+  }, []);
+
+  const handleMapFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    const eventName = e.target.dataset.eventName;
+    
+    if (!file || !eventName) return;
+    
+    try {
+      const parsedMapData = await parseMapFile(file);
+      if (!parsedMapData) {
+        alert('マップデータの解析に失敗しました。');
+        return;
+      }
+      
+      setMapData(prev => ({
+        ...prev,
+        [eventName]: {
+          ...(prev[eventName] || {}),
+          ...parsedMapData,
+        },
+      }));
+      
+      const mapCount = Object.keys(parsedMapData).length;
+      alert(`${mapCount}件のマップデータを取り込みました。`);
+      
+      // 最初のマップタブに切り替え
+      const firstMapName = Object.keys(parsedMapData)[0];
+      if (firstMapName) {
+        setActiveTab(firstMapName);
+      }
+    } catch (error) {
+      console.error('Map import error:', error);
+      alert(`マップデータの取り込みに失敗しました: ${error instanceof Error ? error.message : '不明なエラー'}`);
+    }
+    
+    // ファイル入力をリセット
+    e.target.value = '';
+  }, []);
+
+  // マップビューでの訪問先追加
+  const handleAddToExecuteListFromMap = useCallback((itemId: string) => {
+    if (!activeEventName || !isMapTab) return;
+    
+    // マップ名から参加日を取得
+    const dayMatch = activeTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return;
+    const dayName = dayMatch[1];
+    
+    // アイテムのホールIDを取得
+    const item = items.find(i => i.id === itemId);
+    if (!item) return;
+    
+    // ホール定義を取得
+    const halls = hallDefinitions[activeEventName]?.[activeTab] || [];
+    const hallRouteSettingsForMap = hallRouteSettings[activeEventName]?.[activeTab] || { hallOrder: [], hallVisitLists: [] };
+    
+    // アイテムのブロックからホールIDを特定
+    const currentMapData = mapData[activeEventName]?.[activeTab];
+    let itemHallId: string | null = null;
+    
+    if (currentMapData && halls.length > 0) {
+      const itemBlockName = item.block?.trim() || '';
+      const block = currentMapData.blocks.find(b => b.name === itemBlockName);
+      
+      if (block) {
+        const centerRow = (block.startRow + block.endRow) / 2;
+        const centerCol = (block.startCol + block.endCol) / 2;
+        
+        for (const hall of halls) {
+          if (hall.vertices.length >= 4 && isPointInPolygon(centerRow, centerCol, hall.vertices)) {
+            itemHallId = hall.id;
+            break;
+          }
+        }
+      }
+    }
+    
+    setExecuteModeItems(prev => {
+      const eventItems = prev[activeEventName] || {};
+      const dayItems = [...(eventItems[dayName] || [])];
+      
+      // 既に追加されている場合は何もしない
+      if (dayItems.includes(itemId)) return prev;
+      
+      // ホールが特定できない場合は末尾に追加
+      if (!itemHallId || halls.length === 0) {
+        dayItems.push(itemId);
+        return {
+          ...prev,
+          [activeEventName]: {
+            ...eventItems,
+            [dayName]: dayItems,
+          },
+        };
+      }
+      
+      // ホール順序を取得（設定がなければホールの定義順）
+      const hallOrder = hallRouteSettingsForMap.hallOrder.length > 0 
+        ? hallRouteSettingsForMap.hallOrder 
+        : halls.map(h => h.id);
+      
+      // 各アイテムのホールIDをマップ
+      const itemsMap = new Map(items.map(i => [i.id, i]));
+      const getHallIdForItem = (id: string): string | null => {
+        const targetItem = itemsMap.get(id);
+        if (!targetItem || !currentMapData) return null;
+        
+        const blockName = targetItem.block?.trim() || '';
+        const targetBlock = currentMapData.blocks.find(b => b.name === blockName);
+        if (!targetBlock) return null;
+        
+        const cRow = (targetBlock.startRow + targetBlock.endRow) / 2;
+        const cCol = (targetBlock.startCol + targetBlock.endCol) / 2;
+        
+        for (const hall of halls) {
+          if (hall.vertices.length >= 4 && isPointInPolygon(cRow, cCol, hall.vertices)) {
+            return hall.id;
+          }
+        }
+        return null;
+      };
+      
+      // 同じホールの最後の位置を探す
+      let insertIndex = dayItems.length; // デフォルトは末尾
+      const itemHallIndex = hallOrder.indexOf(itemHallId);
+      
+      if (itemHallIndex >= 0) {
+        // 同じホールの最後のアイテムの位置を探す
+        let lastSameHallIndex = -1;
+        let firstLaterHallIndex = -1;
+        
+        for (let i = 0; i < dayItems.length; i++) {
+          const existingItemHallId = getHallIdForItem(dayItems[i]);
+          if (existingItemHallId === itemHallId) {
+            lastSameHallIndex = i;
+          } else if (existingItemHallId) {
+            const existingHallIndex = hallOrder.indexOf(existingItemHallId);
+            if (existingHallIndex > itemHallIndex && firstLaterHallIndex === -1) {
+              firstLaterHallIndex = i;
+            }
+          }
+        }
+        
+        if (lastSameHallIndex >= 0) {
+          // 同じホールのアイテムがある場合、その次に挿入
+          insertIndex = lastSameHallIndex + 1;
+        } else if (firstLaterHallIndex >= 0) {
+          // 同じホールのアイテムがないが、後のホールのアイテムがある場合、その前に挿入
+          insertIndex = firstLaterHallIndex;
+        }
+      }
+      
+      dayItems.splice(insertIndex, 0, itemId);
+      
+      return {
+        ...prev,
+        [activeEventName]: {
+          ...eventItems,
+          [dayName]: dayItems,
+        },
+      };
+    });
+  }, [activeEventName, activeTab, isMapTab, items, hallDefinitions, hallRouteSettings, mapData]);
+
+  // マップビューでの訪問先削除
+  const handleRemoveFromExecuteListFromMap = useCallback((itemId: string) => {
+    if (!activeEventName || !isMapTab) return;
+    
+    // マップ名から参加日を取得
+    const dayMatch = activeTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return;
+    const dayName = dayMatch[1];
+    
+    setExecuteModeItems(prev => {
+      const eventItems = prev[activeEventName] || {};
+      const dayItems = (eventItems[dayName] || []).filter(id => id !== itemId);
+      
+      return {
+        ...prev,
+        [activeEventName]: {
+          ...eventItems,
+          [dayName]: dayItems,
+        },
+      };
+    });
+  }, [activeEventName, activeTab, isMapTab]);
+
+  // マップビューでの先頭移動
+  const handleMoveToFirstFromMap = useCallback((itemId: string) => {
+    if (!activeEventName || !isMapTab) return;
+    
+    const dayMatch = activeTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return;
+    const dayName = dayMatch[1];
+    
+    setExecuteModeItems(prev => {
+      const eventItems = prev[activeEventName] || {};
+      const dayItems = (eventItems[dayName] || []).filter(id => id !== itemId);
+      
+      return {
+        ...prev,
+        [activeEventName]: {
+          ...eventItems,
+          [dayName]: [itemId, ...dayItems],
+        },
+      };
+    });
+  }, [activeEventName, activeTab, isMapTab]);
+
+  // マップビューでの末尾移動
+  const handleMoveToLastFromMap = useCallback((itemId: string) => {
+    if (!activeEventName || !isMapTab) return;
+    
+    const dayMatch = activeTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return;
+    const dayName = dayMatch[1];
+    
+    setExecuteModeItems(prev => {
+      const eventItems = prev[activeEventName] || {};
+      const dayItems = (eventItems[dayName] || []).filter(id => id !== itemId);
+      
+      return {
+        ...prev,
+        [activeEventName]: {
+          ...eventItems,
+          [dayName]: [...dayItems, itemId],
+        },
+      };
+    });
+  }, [activeEventName, activeTab, isMapTab]);
+
+  // 現在のマップに対応する参加日の実行列アイテムIDを取得
+  const currentMapExecuteItemIds = useMemo(() => {
+    if (!activeEventName || !isMapTab) return [];
+    
+    const dayMatch = activeTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return [];
+    const dayName = dayMatch[1];
+    
+    return executeModeItems[activeEventName]?.[dayName] || [];
+  }, [activeEventName, activeTab, isMapTab, executeModeItems]);
   
   // 現在のタブの参加日に該当するアイテムを取得
   const currentTabItems = useMemo(() => {
@@ -2038,16 +2634,720 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
     return items.filter(item => item.eventDate === activeTab);
   }, [items, activeTab, activeEventName, eventDates]);
 
-  const TabButton: React.FC<{tab: ActiveTab, label: string, count?: number, onClick?: () => void}> = ({ tab, label, count, onClick }) => {
-    const longPressTimeout = React.useRef<number | null>(null);
+  // マップタブメニューの状態
+  const [mapTabMenuOpen, setMapTabMenuOpen] = useState<string | null>(null);
+  const [mapTabMenuPosition, setMapTabMenuPosition] = useState<{ left: number; top: number }>({ left: 0, top: 0 });
+  const [visitListPanelOpen, setVisitListPanelOpen] = useState(false);
+  const [visitListPanelMapTab, setVisitListPanelMapTab] = useState<string | null>(null);  // 訪問先リストを開いた時のマップタブ
+  const [visitListHasUnsavedChanges, setVisitListHasUnsavedChanges] = useState(false);
+  const [visitListOriginalOrder, setVisitListOriginalOrder] = useState<string[]>([]);  // 元の順序（アイテムID）
+  const [highlightedMapCell, setHighlightedMapCell] = useState<{ row: number; col: number } | null>(null);
+  const [showVisitListConfirmDialog, setShowVisitListConfirmDialog] = useState(false);
+  const [pendingTabChange, setPendingTabChange] = useState<string | null>(null);
+  const [blockDefinitionMode, setBlockDefinitionMode] = useState(false);
+  
+  // セル選択モードの状態（ブロック定義用）
+  const [cellSelectionMode, setCellSelectionMode] = useState<{
+    type: 'corner' | 'multiCorner' | 'rangeStart' | 'individual';
+    clickedCells: { row: number; col: number }[];
+    editingBlockData?: unknown;
+  } | null>(null);
+  
+  // セル選択完了時にBlockDefinitionPanelに渡すデータ
+  const [pendingCellSelection, setPendingCellSelection] = useState<{
+    type: string;
+    cells: { row: number; col: number }[];
+    editingData?: unknown;
+  } | null>(null);
 
-    const handlePointerDown = () => {
-      if (!eventDates.includes(tab)) return;
+  // 訪問先リストパネルを開く
+  const openVisitListPanel = useCallback((mapTab: string) => {
+    if (!activeEventName) return;
+    
+    // 対応する日付を取得（例：「1日目マップ」→「1日目」）
+    const dayMatch = mapTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return;
+    const dayName = dayMatch[1];
+    
+    // 実行列のアイテムIDを取得
+    const executeIds = executeModeItems[activeEventName]?.[dayName] || [];
+    
+    // 元の順序を保存
+    setVisitListOriginalOrder([...executeIds]);
+    setVisitListPanelMapTab(mapTab);
+    setVisitListHasUnsavedChanges(false);
+    setVisitListPanelOpen(true);
+  }, [activeEventName, executeModeItems]);
+
+  // 訪問先リストの順序を更新
+  const handleVisitListOrderUpdate = useCallback((newOrderItems: ShoppingItem[]) => {
+    if (!visitListPanelMapTab || !activeEventName) return;
+    
+    const dayMatch = visitListPanelMapTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return;
+    const dayName = dayMatch[1];
+    
+    // 新しい順序のID配列
+    const newIds = newOrderItems.map(item => item.id);
+    
+    // executeModeItemsを更新
+    setExecuteModeItems(prev => ({
+      ...prev,
+      [activeEventName]: {
+        ...prev[activeEventName],
+        [dayName]: newIds,
+      },
+    }));
+    setVisitListHasUnsavedChanges(true);
+  }, [visitListPanelMapTab, activeEventName]);
+
+  // 訪問先リストの確定
+  const handleVisitListConfirm = useCallback(() => {
+    setVisitListHasUnsavedChanges(false);
+    setVisitListOriginalOrder([]);
+  }, []);
+
+  // 訪問先リストのキャンセル
+  const handleVisitListCancel = useCallback(() => {
+    if (!visitListPanelMapTab || !activeEventName) return;
+    
+    const dayMatch = visitListPanelMapTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return;
+    const dayName = dayMatch[1];
+    
+    // 元の順序に戻す
+    if (visitListOriginalOrder.length > 0) {
+      setExecuteModeItems(prev => ({
+        ...prev,
+        [activeEventName]: {
+          ...prev[activeEventName],
+          [dayName]: [...visitListOriginalOrder],
+        },
+      }));
+    }
+    setVisitListHasUnsavedChanges(false);
+    setVisitListOriginalOrder([]);
+  }, [visitListOriginalOrder, visitListPanelMapTab, activeEventName]);
+
+  // 訪問先リストパネルを閉じる（変更を保持）
+  const handleVisitListClose = useCallback(() => {
+    setVisitListPanelOpen(false);
+    // 履歴と状態は保持（閉じただけでは破棄しない）
+  }, []);
+
+  // マップセルのハイライト
+  const handleHighlightMapCell = useCallback((row: number, col: number) => {
+    setHighlightedMapCell({ row, col });
+  }, []);
+
+  const handleClearMapCellHighlight = useCallback(() => {
+    setHighlightedMapCell(null);
+  }, []);
+
+  // 訪問先リスト用の実行列アイテム
+  const visitListItems = useMemo(() => {
+    if (!visitListPanelMapTab || !activeEventName) return [];
+    
+    const dayMatch = visitListPanelMapTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return [];
+    const dayName = dayMatch[1];
+    
+    const dayItems = items.filter(item => item.eventDate === dayName);
+    const executeIds = executeModeItems[activeEventName]?.[dayName] || [];
+    
+    // executeIdsの順序で返す
+    return executeIds
+      .filter((id: string) => dayItems.some(item => item.id === id))
+      .map((id: string) => dayItems.find(item => item.id === id)!)
+      .filter(Boolean);
+  }, [visitListPanelMapTab, activeEventName, items, executeModeItems]);
+
+  // 訪問先リスト用のホール順序
+  const visitListHallOrder = useMemo(() => {
+    if (!visitListPanelMapTab || !activeEventName) return [];
+    
+    const halls = hallDefinitions[activeEventName]?.[visitListPanelMapTab] || [];
+    const routeSettings = hallRouteSettings[activeEventName]?.[visitListPanelMapTab];
+    
+    if (routeSettings?.hallOrder && routeSettings.hallOrder.length > 0) {
+      return routeSettings.hallOrder;
+    }
+    
+    // デフォルトはホール定義順
+    return halls.map(h => h.id);
+  }, [visitListPanelMapTab, activeEventName, hallDefinitions, hallRouteSettings]);
+
+  // アイテムの優先度を変更するハンドラ
+  const handleUpdateItemPriority = useCallback((itemId: string, priorityLevel: 'none' | 'priority' | 'highest') => {
+    if (!activeEventName || !visitListPanelMapTab) return;
+    
+    // アイテムの優先度を更新
+    setEventLists(prev => ({
+      ...prev,
+      [activeEventName]: (prev[activeEventName] || []).map(item => 
+        item.id === itemId ? { ...item, priorityLevel } : item
+      )
+    }));
+    
+    // アイテムのホールIDを取得
+    const item = items.find(i => i.id === itemId);
+    if (!item) return;
+    
+    const halls = hallDefinitions[activeEventName]?.[visitListPanelMapTab] || [];
+    const mapDataForTab = mapData[activeEventName]?.[visitListPanelMapTab];
+    
+    // アイテムのホールIDを特定
+    let itemHallId: string | null = null;
+    if (mapDataForTab) {
+      const block = mapDataForTab.blocks.find(b => b.name === item.block);
+      if (block) {
+        const numMatch = item.number?.match(/\d+/);
+        if (numMatch) {
+          const num = parseInt(numMatch[0], 10);
+          const cell = block.numberCells.find(nc => nc.value === num);
+          if (cell) {
+            for (const hall of halls) {
+              // 多角形内判定
+              const isPointInPolygon = (row: number, col: number, vertices: { row: number; col: number }[]): boolean => {
+                if (vertices.length < 3) return false;
+                let inside = false;
+                for (let i = 0, j = vertices.length - 1; i < vertices.length; j = i++) {
+                  const xi = vertices[i].col, yi = vertices[i].row;
+                  const xj = vertices[j].col, yj = vertices[j].row;
+                  if (((yi > row) !== (yj > row)) && (col < (xj - xi) * (row - yi) / (yj - yi) + xi)) {
+                    inside = !inside;
+                  }
+                }
+                return inside;
+              };
+              
+              if (isPointInPolygon(cell.row, cell.col, hall.vertices)) {
+                itemHallId = hall.id;
+                break;
+              }
+              // 頂点上にあるか
+              for (const vertex of hall.vertices) {
+                if (vertex.row === cell.row && vertex.col === cell.col) {
+                  itemHallId = hall.id;
+                  break;
+                }
+              }
+              if (itemHallId) break;
+            }
+          }
+        }
+      }
+    }
+    
+    // グループIDを生成
+    const buildGroupId = (hallId: string | null, priority: 'none' | 'priority' | 'highest'): string => {
+      if (hallId === null) {
+        if (priority === 'highest') return 'undefined:highest';
+        if (priority === 'priority') return 'undefined:priority';
+        return 'undefined';
+      }
+      if (priority === 'highest') return `${hallId}:highest`;
+      if (priority === 'priority') return `${hallId}:priority`;
+      return hallId;
+    };
+    
+    const newGroupId = buildGroupId(itemHallId, priorityLevel);
+    const oldPriority = item.priorityLevel || 'none';
+    const oldGroupId = buildGroupId(itemHallId, oldPriority);
+    const baseGroupId = buildGroupId(itemHallId, 'none');
+    
+    // hallOrderを更新
+    setHallRouteSettings(prev => {
+      const currentSettings = prev[activeEventName]?.[visitListPanelMapTab] || { hallOrder: [], hallVisitLists: [] };
+      let newHallOrder = [...currentSettings.hallOrder];
+      
+      // 現在のhallOrderにベースホール（通常グループ）がなければ追加
+      if (!newHallOrder.includes(baseGroupId)) {
+        newHallOrder.push(baseGroupId);
+      }
+      
+      // 新しいグループが必要か確認（通常グループに戻す場合は不要）
+      if (priorityLevel !== 'none' && !newHallOrder.includes(newGroupId)) {
+        // 通常グループ（または優先グループ）の直前に挿入
+        const priorityGroupId = buildGroupId(itemHallId, 'priority');
+        
+        // 挿入位置を決定
+        let insertIndex = newHallOrder.length;
+        
+        if (priorityLevel === 'highest') {
+          // 最優先は、優先グループまたは通常グループの直前
+          const priorityIndex = newHallOrder.indexOf(priorityGroupId);
+          const baseIndex = newHallOrder.indexOf(baseGroupId);
+          
+          if (priorityIndex !== -1) {
+            insertIndex = priorityIndex;
+          } else if (baseIndex !== -1) {
+            insertIndex = baseIndex;
+          }
+        } else if (priorityLevel === 'priority') {
+          // 優先は通常グループの直前
+          const baseIndex = newHallOrder.indexOf(baseGroupId);
+          if (baseIndex !== -1) {
+            insertIndex = baseIndex;
+          }
+        }
+        
+        newHallOrder.splice(insertIndex, 0, newGroupId);
+      }
+      
+      // 古いグループが空になるか確認（同じホール・同じ優先度の他のアイテムがあるか）
+      // 注意: この時点ではitemの優先度は既に更新されているため、更新後のitemsを使う必要がある
+      // しかし、setEventListsとsetHallRouteSettingsは非同期なので、現在のitemsを使う
+      if (oldPriority !== 'none' && oldGroupId !== newGroupId) {
+        // 同じホール・同じ優先度の他のアイテムがあるか確認
+        const otherItemsInOldGroup = items.filter(i => {
+          if (i.id === itemId) return false;
+          if ((i.priorityLevel || 'none') !== oldPriority) return false;
+          
+          // 同じホールかどうか確認
+          if (!mapDataForTab) return false;
+          const iBlock = mapDataForTab.blocks.find(b => b.name === i.block);
+          if (!iBlock) return false;
+          const iNumMatch = i.number?.match(/\d+/);
+          if (!iNumMatch) return false;
+          const iNum = parseInt(iNumMatch[0], 10);
+          const iCell = iBlock.numberCells.find(nc => nc.value === iNum);
+          if (!iCell) return false;
+          
+          // このアイテムのホールIDを特定
+          let iHallId: string | null = null;
+          for (const h of halls) {
+            const inPoly = (() => {
+              if (h.vertices.length < 3) return false;
+              let inside = false;
+              for (let ii = 0, j = h.vertices.length - 1; ii < h.vertices.length; j = ii++) {
+                const xi = h.vertices[ii].col, yi = h.vertices[ii].row;
+                const xj = h.vertices[j].col, yj = h.vertices[j].row;
+                if (((yi > iCell.row) !== (yj > iCell.row)) && (iCell.col < (xj - xi) * (iCell.row - yi) / (yj - yi) + xi)) {
+                  inside = !inside;
+                }
+              }
+              return inside;
+            })();
+            
+            if (inPoly) {
+              iHallId = h.id;
+              break;
+            }
+            for (const vertex of h.vertices) {
+              if (vertex.row === iCell.row && vertex.col === iCell.col) {
+                iHallId = h.id;
+                break;
+              }
+            }
+            if (iHallId) break;
+          }
+          
+          return iHallId === itemHallId;
+        });
+        
+        if (otherItemsInOldGroup.length === 0) {
+          newHallOrder = newHallOrder.filter(id => id !== oldGroupId);
+        }
+      }
+      
+      return {
+        ...prev,
+        [activeEventName]: {
+          ...prev[activeEventName],
+          [visitListPanelMapTab]: {
+            ...currentSettings,
+            hallOrder: newHallOrder,
+          },
+        },
+      };
+    });
+  }, [activeEventName, visitListPanelMapTab, items, hallDefinitions, mapData]);
+
+  // タブ変更時の確認ダイアログ処理（将来的にTabButtonで使用）
+  void function handleTabChangeWithVisitListCheck(newTab: string) {
+    if (visitListPanelOpen && visitListHasUnsavedChanges) {
+      setPendingTabChange(newTab);
+      setShowVisitListConfirmDialog(true);
+      return false;
+    }
+    return true;
+  };
+
+  // 確認ダイアログで確定を選択
+  const handleVisitListDialogConfirm = useCallback(() => {
+    handleVisitListConfirm();
+    setShowVisitListConfirmDialog(false);
+    setVisitListPanelOpen(false);
+    if (pendingTabChange) {
+      setActiveTab(pendingTabChange as ActiveTab);
+      setPendingTabChange(null);
+    }
+  }, [handleVisitListConfirm, pendingTabChange]);
+
+  // 確認ダイアログでキャンセルを選択
+  const handleVisitListDialogCancel = useCallback(() => {
+    handleVisitListCancel();
+    setShowVisitListConfirmDialog(false);
+    setVisitListPanelOpen(false);
+    if (pendingTabChange) {
+      setActiveTab(pendingTabChange as ActiveTab);
+      setPendingTabChange(null);
+    }
+  }, [handleVisitListCancel, pendingTabChange]);
+  
+  // ブロック定義を更新
+  const handleUpdateBlocks = useCallback((blocks: BlockDefinition[]) => {
+    if (!activeEventName || !isMapTab || !currentMapData) return;
+    
+    setMapData(prev => ({
+      ...prev,
+      [activeEventName]: {
+        ...prev[activeEventName],
+        [activeTab]: {
+          ...currentMapData,
+          blocks,
+        },
+      },
+    }));
+  }, [activeEventName, isMapTab, activeTab, currentMapData]);
+
+  // ホール定義を更新
+  const handleUpdateHalls = useCallback((halls: HallDefinition[]) => {
+    if (!activeEventName || !isMapTab) return;
+    
+    setHallDefinitions(prev => ({
+      ...prev,
+      [activeEventName]: {
+        ...prev[activeEventName],
+        [activeTab]: halls,
+      },
+    }));
+    
+    // ホール順序も更新（新規ホールはリストの最後に追加）
+    const existingOrder = currentHallRouteSettings.hallOrder;
+    const newHallIds = halls.map(h => h.id);
+    const updatedOrder = [
+      ...existingOrder.filter(id => newHallIds.includes(id)),
+      ...newHallIds.filter(id => !existingOrder.includes(id)),
+    ];
+    
+    setHallRouteSettings(prev => ({
+      ...prev,
+      [activeEventName]: {
+        ...prev[activeEventName],
+        [activeTab]: {
+          ...currentHallRouteSettings,
+          hallOrder: updatedOrder,
+        },
+      },
+    }));
+  }, [activeEventName, isMapTab, activeTab, currentHallRouteSettings]);
+
+  // ホールルート設定を更新
+  const handleUpdateHallRouteSettings = useCallback((settings: HallRouteSettings) => {
+    if (!activeEventName || !isMapTab) return;
+    
+    setHallRouteSettings(prev => ({
+      ...prev,
+      [activeEventName]: {
+        ...prev[activeEventName],
+        [activeTab]: settings,
+      },
+    }));
+  }, [activeEventName, isMapTab, activeTab]);
+
+  // 実行列をホール順序で並び替え
+  const handleReorderExecuteListByHallOrder = useCallback((hallOrder: string[]) => {
+    if (!activeEventName || !isMapTab) return;
+    
+    const dayMatch = activeTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return;
+    const dayName = dayMatch[1];
+    
+    const currentMapData = mapData[activeEventName]?.[activeTab];
+    const halls = hallDefinitions[activeEventName]?.[activeTab] || [];
+    const currentHallRouteSettings = hallRouteSettings[activeEventName]?.[activeTab] || { hallOrder: [], hallVisitLists: [] };
+    
+    if (!currentMapData || halls.length === 0) return;
+    
+    setExecuteModeItems(prev => {
+      const eventItems = prev[activeEventName] || {};
+      const dayItems = [...(eventItems[dayName] || [])];
+      
+      if (dayItems.length === 0) return prev;
+      
+      // 各アイテムのホールIDを取得する関数
+      const itemsMap = new Map(items.map(i => [i.id, i]));
+      const getHallIdForItem = (itemId: string): string | null => {
+        const item = itemsMap.get(itemId);
+        if (!item || !currentMapData) return null;
+        
+        const blockName = item.block?.trim() || '';
+        // 完全一致優先でブロックを検索
+        let block = currentMapData.blocks.find(b => b.name === blockName);
+        if (!block) {
+          const candidates = currentMapData.blocks.filter(b => 
+            b.name.toLowerCase() === blockName.toLowerCase()
+          );
+          if (candidates.length === 1) {
+            block = candidates[0];
+          }
+        }
+        if (!block) return null;
+        
+        const centerRow = (block.startRow + block.endRow) / 2;
+        const centerCol = (block.startCol + block.endCol) / 2;
+        
+        for (const hall of halls) {
+          if (hall.vertices.length >= 4 && isPointInPolygon(centerRow, centerCol, hall.vertices)) {
+            return hall.id;
+          }
+        }
+        return null;
+      };
+      
+      // アイテムをホールごとにグループ化
+      const itemsByHall = new Map<string | null, Set<string>>();
+      dayItems.forEach(itemId => {
+        const hallId = getHallIdForItem(itemId);
+        if (!itemsByHall.has(hallId)) {
+          itemsByHall.set(hallId, new Set());
+        }
+        itemsByHall.get(hallId)!.add(itemId);
+      });
+      
+      // hallVisitListsの順序マップを作成
+      const visitOrderMap = new Map<string, number>();
+      currentHallRouteSettings.hallVisitLists.forEach(list => {
+        list.itemIds.forEach((itemId, index) => {
+          visitOrderMap.set(itemId, index);
+        });
+      });
+      
+      // ホール内のアイテムを訪問先指定順でソート
+      const sortItemsInHall = (itemIds: Set<string>): string[] => {
+        const itemsArray = Array.from(itemIds);
+        return itemsArray.sort((a, b) => {
+          const orderA = visitOrderMap.get(a);
+          const orderB = visitOrderMap.get(b);
+          
+          // 両方とも訪問先リストにある場合、その順序で並べる
+          if (orderA !== undefined && orderB !== undefined) {
+            return orderA - orderB;
+          }
+          // 一方のみがリストにある場合、リストにある方を先に
+          if (orderA !== undefined) return -1;
+          if (orderB !== undefined) return 1;
+          // どちらもリストにない場合、元の実行列順序を維持
+          return dayItems.indexOf(a) - dayItems.indexOf(b);
+        });
+      };
+      
+      // ホール順序に従って並び替え
+      const reorderedItems: string[] = [];
+      
+      // まずホール順序に従って追加
+      hallOrder.forEach(hallId => {
+        const hallItems = itemsByHall.get(hallId);
+        if (hallItems && hallItems.size > 0) {
+          reorderedItems.push(...sortItemsInHall(hallItems));
+          itemsByHall.delete(hallId);
+        }
+      });
+      
+      // ホール順序に含まれていないホールのアイテムを追加
+      itemsByHall.forEach((hallItems) => {
+        if (hallItems.size > 0) {
+          reorderedItems.push(...sortItemsInHall(hallItems));
+        }
+      });
+      
+      return {
+        ...prev,
+        [activeEventName]: {
+          ...eventItems,
+          [dayName]: reorderedItems,
+        },
+      };
+    });
+  }, [activeEventName, isMapTab, activeTab, mapData, hallDefinitions, hallRouteSettings, items]);
+
+  // ホール定義モードの状態
+  const [hallDefinitionMode, setHallDefinitionMode] = useState(false);
+
+  // ホール頂点選択モードの状態
+  const [vertexSelectionMode, setVertexSelectionMode] = useState<{
+    clickedVertices: { row: number; col: number }[];
+    editingData?: unknown;
+  } | null>(null);
+
+  // ホール頂点選択完了時にHallDefinitionPanelに渡すデータ
+  const [pendingVertexSelection, setPendingVertexSelection] = useState<{
+    vertices: { row: number; col: number }[];
+    editingData?: unknown;
+  } | null>(null);
+
+  // ホール頂点選択モードを開始
+  const handleStartVertexSelection = useCallback((editingData?: unknown) => {
+    setVertexSelectionMode({ clickedVertices: [], editingData });
+    setHallDefinitionMode(false);
+  }, []);
+
+  // ホール頂点選択を確定
+  const handleConfirmVertexSelection = useCallback(() => {
+    if (vertexSelectionMode) {
+      setPendingVertexSelection({
+        vertices: vertexSelectionMode.clickedVertices,
+        editingData: vertexSelectionMode.editingData,
+      });
+    }
+    setVertexSelectionMode(null);
+    setHallDefinitionMode(true);
+  }, [vertexSelectionMode]);
+
+  // ホール頂点選択をキャンセル
+  const handleCancelVertexSelection = useCallback(() => {
+    if (vertexSelectionMode?.editingData) {
+      setPendingVertexSelection({
+        vertices: [],
+        editingData: vertexSelectionMode.editingData,
+      });
+    }
+    setVertexSelectionMode(null);
+    setHallDefinitionMode(true);
+  }, [vertexSelectionMode]);
+
+  // マップセルクリック時にホール頂点選択に追加/削除
+  useEffect(() => {
+    const handleMapCellClickForVertex = (e: CustomEvent<{ row: number; col: number }>) => {
+      if (!vertexSelectionMode) return;
+      
+      const { row, col } = e.detail;
+      
+      setVertexSelectionMode(prev => {
+        if (!prev) return prev;
+        
+        // 既存の頂点をクリックした場合は削除
+        const existingIndex = prev.clickedVertices.findIndex(v => v.row === row && v.col === col);
+        if (existingIndex !== -1) {
+          return {
+            ...prev,
+            clickedVertices: prev.clickedVertices.filter((_, i) => i !== existingIndex),
+          };
+        }
+        
+        // 最大6頂点まで
+        if (prev.clickedVertices.length >= 6) {
+          return prev;
+        }
+        
+        return {
+          ...prev,
+          clickedVertices: [...prev.clickedVertices, { row, col }],
+        };
+      });
+    };
+    
+    window.addEventListener('mapCellClick', handleMapCellClickForVertex as EventListener);
+    return () => {
+      window.removeEventListener('mapCellClick', handleMapCellClickForVertex as EventListener);
+    };
+  }, [vertexSelectionMode]);
+  
+  // セル選択モードを開始（BlockDefinitionPanelから呼ばれる）
+  const handleStartCellSelection = useCallback((
+    type: 'corner' | 'multiCorner' | 'rangeStart' | 'individual',
+    editingData?: unknown
+  ) => {
+    setCellSelectionMode({ type, clickedCells: [], editingBlockData: editingData });
+    setBlockDefinitionMode(false); // パネルを一時的に非表示
+  }, []);
+  
+  // 範囲を反映してパネルを再表示
+  const handleConfirmCellSelection = useCallback(() => {
+    if (cellSelectionMode) {
+      // pendingCellSelectionをセットしてBlockDefinitionPanelに渡す
+      setPendingCellSelection({
+        type: cellSelectionMode.type,
+        cells: cellSelectionMode.clickedCells,
+        editingData: cellSelectionMode.editingBlockData,
+      });
+    }
+    setCellSelectionMode(null);
+    setBlockDefinitionMode(true); // パネルを再表示
+  }, [cellSelectionMode]);
+  
+  // セル選択をキャンセル（編集画面に戻る）
+  const handleCancelCellSelection = useCallback(() => {
+    // 編集データを保持したままパネルを再表示
+    if (cellSelectionMode?.editingBlockData) {
+      setPendingCellSelection({
+        type: 'cancelled', // キャンセル用の特殊タイプ
+        cells: [],
+        editingData: cellSelectionMode.editingBlockData,
+      });
+    }
+    setCellSelectionMode(null);
+    setBlockDefinitionMode(true); // パネルを再表示
+  }, [cellSelectionMode]);
+  
+  // マップセルクリックをリッスンしてセル選択に追加
+  useEffect(() => {
+    const handleMapCellClick = (e: CustomEvent<{ row: number; col: number }>) => {
+      if (!cellSelectionMode) return;
+      
+      const { row, col } = e.detail;
+      
+      setCellSelectionMode(prev => {
+        if (!prev) return prev;
+        
+        // 既に選択されている場合は削除（個別モードのみ）
+        if (prev.type === 'individual') {
+          const existingIndex = prev.clickedCells.findIndex(c => c.row === row && c.col === col);
+          if (existingIndex >= 0) {
+            return {
+              ...prev,
+              clickedCells: prev.clickedCells.filter((_, i) => i !== existingIndex),
+            };
+          }
+        }
+        
+        // 選択を追加
+        return {
+          ...prev,
+          clickedCells: [...prev.clickedCells, { row, col }],
+        };
+      });
+    };
+    
+    window.addEventListener('mapCellClick', handleMapCellClick as EventListener);
+    return () => window.removeEventListener('mapCellClick', handleMapCellClick as EventListener);
+  }, [cellSelectionMode]);
+
+  const TabButton: React.FC<{tab: ActiveTab, label: string, count?: number, onClick?: () => void, isMapTab?: boolean}> = ({ tab, label, count, onClick, isMapTab: isMapTabProp }) => {
+    const longPressTimeout = React.useRef<number | null>(null);
+    const menuRef = React.useRef<HTMLDivElement>(null);
+    const buttonRef = React.useRef<HTMLButtonElement>(null);
+
+    const handlePointerDown = (e: React.PointerEvent) => {
       if (!activeEventName) return;
       
+      // 長押し開始時にボタンの位置を記録
+      const target = e.currentTarget as HTMLButtonElement;
+      const rect = target.getBoundingClientRect();
+      const menuLeft = rect.left + rect.width / 2;
+      const menuTop = rect.bottom + 4;
+      
       longPressTimeout.current = window.setTimeout(() => {
-        // 長押しでモード切り替え
-        handleToggleMode();
+        if (isMapTabProp) {
+          // マップタブの長押しメニュー - 記録した位置でメニューを表示
+          setMapTabMenuPosition({ left: menuLeft, top: menuTop });
+          setMapTabMenuOpen(tab);
+        } else if (eventDates.includes(tab)) {
+          // 通常の日付タブの長押し（モード切り替え）
+          handleToggleMode();
+        }
         longPressTimeout.current = null;
       }, 500);
     };
@@ -2060,6 +3360,16 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
     };
 
     const handleClick = () => {
+      // メニューが開いている場合
+      if (mapTabMenuOpen) {
+        // このタブのメニューが開いている場合は閉じるだけ
+        if (mapTabMenuOpen === tab) {
+          setMapTabMenuOpen(null);
+          return;
+        }
+        // 他のタブのメニューが開いている場合は閉じてタブ遷移
+        setMapTabMenuOpen(null);
+      }
       if (onClick) {
         onClick();
       } else {
@@ -2071,9 +3381,52 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       }
     };
 
+    // メニュー外クリックで閉じる
+    React.useEffect(() => {
+      const handleClickOutside = (e: MouseEvent) => {
+        if (menuRef.current && !menuRef.current.contains(e.target as Node) &&
+            buttonRef.current && !buttonRef.current.contains(e.target as Node)) {
+          setMapTabMenuOpen(null);
+        }
+      };
+      if (mapTabMenuOpen === tab) {
+        document.addEventListener('mousedown', handleClickOutside);
+        return () => document.removeEventListener('mousedown', handleClickOutside);
+      }
+    }, [tab]);
+
+    // メニュー項目クリック時：まずそのタブに遷移してから機能を開く
+    const handleMenuItemClick = (action: 'visitList' | 'blockDefinition' | 'hallDefinition') => {
+      // まずメニューを閉じる
+      setMapTabMenuOpen(null);
+      
+      // 長押ししたタブに遷移
+      setItemToEdit(null);
+      setSelectedItemIds(new Set());
+      setSelectedBlockFilters(new Set());
+      setCandidateNumberSortDirection(null);
+      setActiveTab(tab);
+      
+      // 機能を開く（タブ遷移後に実行されるようsetTimeoutで遅延）
+      setTimeout(() => {
+        switch (action) {
+          case 'visitList':
+            openVisitListPanel(tab);
+            break;
+          case 'blockDefinition':
+            setBlockDefinitionMode(true);
+            break;
+          case 'hallDefinition':
+            setHallDefinitionMode(true);
+            break;
+        }
+      }, 0);
+    };
+
     return (
       <div className="relative">
         <button
+          ref={buttonRef}
           onClick={handleClick}
           onPointerDown={handlePointerDown}
           onPointerUp={handlePointerUp}
@@ -2086,6 +3439,45 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
         >
           {label} {typeof count !== 'undefined' && <span className="text-xs bg-slate-200 dark:text-slate-700 rounded-full px-2 py-0.5 ml-1">{count}</span>}
         </button>
+        
+        {/* マップタブ長押しメニュー - fixed配置でタブのすぐ下に表示 */}
+        {mapTabMenuOpen === tab && isMapTabProp && (
+          <div 
+            ref={menuRef}
+            className="fixed bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 min-w-[180px]"
+            style={{
+              left: `${mapTabMenuPosition.left}px`,
+              top: `${mapTabMenuPosition.top}px`,
+              transform: 'translateX(-50%)',
+              zIndex: 9999,
+            }}
+          >
+            {/* 矢印（上向き） */}
+            <div className="absolute left-1/2 -translate-x-1/2 -top-2">
+              <div className="w-3 h-3 bg-white dark:bg-slate-800 border-l border-t border-slate-200 dark:border-slate-700 transform rotate-45" />
+            </div>
+            <div className="py-1">
+              <button
+                onClick={() => handleMenuItemClick('visitList')}
+                className="w-full px-4 py-3 text-left text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-t-lg flex items-center gap-2"
+              >
+                <span>📍</span> 訪問先リスト
+              </button>
+              <button
+                onClick={() => handleMenuItemClick('blockDefinition')}
+                className="w-full px-4 py-3 text-left text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2"
+              >
+                <span>🔲</span> ブロック定義
+              </button>
+              <button
+                onClick={() => handleMenuItemClick('hallDefinition')}
+                className="w-full px-4 py-3 text-left text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-b-lg flex items-center gap-2"
+              >
+                <span>🏛️</span> ホール定義
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     );
   };
@@ -2095,7 +3487,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
     const currentEventDate = eventDates.includes(activeTab) ? activeTab : (eventDates[0] || '');
     const executeIds = executeModeItems[activeEventName]?.[currentEventDate] || [];
     const itemsMap = new Map(items.map(item => [item.id, item]));
-    return executeIds.map((id: string) => itemsMap.get(id)).filter(Boolean) as ShoppingItem[];
+    return executeIds.map(id => itemsMap.get(id)).filter(Boolean) as ShoppingItem[];
   }, [activeEventName, activeTab, executeModeItems, items, eventDates]);
 
   const visibleItems = useMemo(() => {
@@ -2323,8 +3715,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
     return null;
   }
 
-  const mainContentVisible = eventDates.includes(activeTab) || (activeEventName && eventMapData[activeEventName] && Object.keys(eventMapData[activeEventName]).includes(activeTab));
-  const isMapTab = activeEventName && eventMapData[activeEventName] && Object.keys(eventMapData[activeEventName]).includes(activeTab);
+  const mainContentVisible = eventDates.includes(activeTab);
   
   const handleZoomChange = (newZoom: number) => {
     setZoomLevel(Math.max(30, Math.min(150, newZoom)));
@@ -2408,24 +3799,27 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
                     <>
                         {eventDates.map(eventDate => {
                           const count = items.filter(item => item.eventDate === eventDate).length;
+                          const mapTabName = `${eventDate}マップ`;
+                          const hasMapData = mapTabs.includes(mapTabName);
                           return (
-                            <TabButton 
-                              key={eventDate} 
-                              tab={eventDate} 
-                              label={eventDate} 
-                              count={count} 
-                            />
+                            <React.Fragment key={eventDate}>
+                              <TabButton 
+                                tab={eventDate} 
+                                label={eventDate} 
+                                count={count} 
+                              />
+                              {hasMapData && (
+                                <TabButton 
+                                  tab={mapTabName} 
+                                  label={`${eventDate}マップ`}
+                                  isMapTab={true}
+                                />
+                              )}
+                            </React.Fragment>
                           );
                         })}
-                        {activeEventName && eventMapData[activeEventName] && Object.keys(eventMapData[activeEventName]).map(mapTab => (
-                          <TabButton 
-                            key={mapTab} 
-                            tab={mapTab} 
-                            label={mapTab} 
-                          />
-                        ))}
                         <TabButton tab="import" label={itemToEdit ? "アイテム編集" : "アイテム追加"} />
-                        {activeEventName && mainContentVisible && (
+                        {activeEventName && (mainContentVisible || isMapTab) && (
                           <SearchBar
                             searchKeyword={searchKeyword}
                             onSearchKeywordChange={setSearchKeyword}
@@ -2460,7 +3854,8 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
                 onExport={handleExportEvent}
                 onUpdate={handleUpdateEvent}
                 onRename={(oldName) => handleRenameEvent(oldName)}
-                onImportMap={handleImportMap}
+                onImportMap={handleImportMapData}
+                onImportExportFile={() => exportFileInputRef.current?.click()}
             />
         )}
         {activeTab === 'import' && (
@@ -2472,83 +3867,31 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
              onDoneEditing={handleDoneEditing}
            />
         )}
-        {activeEventName && isMapTab && eventMapData[activeEventName] && eventMapData[activeEventName][activeTab] && (() => {
-          // mapKeyからeventDateを取得（例: "1日目マップ" → "1日目"）
-          const mapKey = activeTab; // activeTabは"1日目マップ"などの形式
-          const eventDate = mapKey.replace('マップ', '');
-          
-          return (
-            <MapView 
-              mapData={eventMapData[activeEventName][activeTab]} 
-              zoomLevel={zoomLevel}
-              mapKey={mapKey}
-              eventDate={eventDate}
-              items={items}
-              onCellSave={(eventDate: string, number: string, block: string | undefined, side: 'A' | 'B', data: {
-                circle: string;
-                title: string;
-                price: number | null;
-              }) => {
-                if (!activeEventName) return;
-                
-                setEventLists(prev => {
-                  const allItems = [...(prev[activeEventName] || [])];
-                  
-                  // eventDate、number、blockで一致するアイテムを検索
-                  const matchingItems = allItems.filter(item => {
-                    const matchesEventDate = item.eventDate === eventDate;
-                    const matchesNumber = item.number === number;
-                    const matchesBlock = !block || item.block === block;
-                    return matchesEventDate && matchesNumber && matchesBlock;
-                  });
-                  
-                  // A側/B側の区別（暫定的に、順序で判断）
-                  let targetItem: ShoppingItem | undefined;
-                  if (side === 'A') {
-                    targetItem = matchingItems[0];
-                  } else {
-                    targetItem = matchingItems[1];
-                  }
-                  
-                  if (targetItem) {
-                    // 既存アイテムを更新（サークル名、タイトル、価格のみ）
-                    const updatedItem: ShoppingItem = {
-                      ...targetItem,
-                      circle: data.circle || targetItem.circle,
-                      title: data.title || targetItem.title,
-                      price: data.price !== null ? data.price : targetItem.price,
-                    };
-                    return {
-                      ...prev,
-                      [activeEventName]: prev[activeEventName].map(item => 
-                        item.id === targetItem!.id ? updatedItem : item
-                      )
-                    };
-                  } else {
-                    // 新規アイテムを作成
-                    const newItem: ShoppingItem = {
-                      id: crypto.randomUUID(),
-                      circle: data.circle,
-                      eventDate: eventDate,
-                      block: block || '',
-                      number: number,
-                      title: data.title,
-                      price: data.price,
-                      purchaseStatus: 'None' as PurchaseStatus,
-                      quantity: 1,
-                      remarks: '',
-                    };
-                    return {
-                      ...prev,
-                      [activeEventName]: insertItemSorted(prev[activeEventName], newItem)
-                    };
-                  }
-                });
-              }}
-            />
-          );
-        })()}
-        {activeEventName && mainContentVisible && !isMapTab && (
+        {/* マップビュー */}
+        {activeEventName && isMapTab && currentMapData && (
+          <MapView
+            mapData={currentMapData}
+            mapName={activeTab}
+            items={items}
+            executeModeItemIds={currentMapExecuteItemIds}
+            onAddToExecuteList={handleAddToExecuteListFromMap}
+            onRemoveFromExecuteList={handleRemoveFromExecuteListFromMap}
+            onMoveToFirst={handleMoveToFirstFromMap}
+            onMoveToLast={handleMoveToLastFromMap}
+            onUpdateItem={handleUpdateItem}
+            onDeleteItem={(itemId) => {
+              const item = items.find(i => i.id === itemId);
+              if (item) handleDeleteRequest(item);
+            }}
+            halls={currentHalls}
+            hallRouteSettings={currentHallRouteSettings}
+            onUpdateHallRouteSettings={handleUpdateHallRouteSettings}
+            onReorderExecuteList={handleReorderExecuteListByHallOrder}
+            vertexSelectionMode={vertexSelectionMode}
+            highlightedCell={visitListPanelOpen ? highlightedMapCell : null}
+          />
+        )}
+        {activeEventName && mainContentVisible && (
           <div style={{
               transform: `scale(${zoomLevel / 100})`,
               transformOrigin: 'top left',
@@ -2581,6 +3924,11 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
                     onToggleRangeSelection={handleToggleRangeSelection}
                     duplicateCircleItemIds={duplicateCircleItemIds}
                     highlightedItemId={highlightedItemId}
+                    layoutMode={layoutMode}
+                    showHallGroups={true}
+                    hallDefinitions={getHallsForDate(eventDates.includes(activeTab) ? activeTab : (eventDates[0] || ''))}
+                    hallOrder={getHallOrderForDate(eventDates.includes(activeTab) ? activeTab : (eventDates[0] || ''))}
+                    mapData={getMapDataForDate(eventDates.includes(activeTab) ? activeTab : (eventDates[0] || ''))}
                   />
                 </div>
                 
@@ -2661,6 +4009,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
                     onToggleRangeSelection={handleToggleRangeSelection}
                     duplicateCircleItemIds={duplicateCircleItemIds}
                     highlightedItemId={highlightedItemId}
+                    layoutMode={layoutMode}
                   />
                 </div>
               </div>
@@ -2682,6 +4031,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
                 onToggleRangeSelection={handleToggleRangeSelection}
                 duplicateCircleItemIds={duplicateCircleItemIds}
                 highlightedItemId={highlightedItemId}
+                layoutMode={layoutMode}
               />
             )}
           </div>
@@ -2732,9 +4082,193 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
         />
       )}
 
+      {/* エクスポートオプションダイアログ */}
+      {showExportOptions && exportEventName && (
+        <ExportOptionsDialog
+          isOpen={showExportOptions}
+          onClose={() => {
+            setShowExportOptions(false);
+            setExportEventName(null);
+          }}
+          onExport={handleConfirmExport}
+          hasMapData={!!(exportEventName && mapData[exportEventName] && Object.keys(mapData[exportEventName]).length > 0)}
+        />
+      )}
+
+      {/* ブロック定義パネル */}
+      {blockDefinitionMode && currentMapData && (
+        <BlockDefinitionPanel
+          isOpen={blockDefinitionMode}
+          onClose={() => { setBlockDefinitionMode(false); setPendingCellSelection(null); }}
+          mapData={currentMapData}
+          onUpdateBlocks={handleUpdateBlocks}
+          onStartCellSelection={handleStartCellSelection}
+          pendingCellSelection={pendingCellSelection}
+          onClearPendingCellSelection={() => setPendingCellSelection(null)}
+        />
+      )}
+
+      {/* セル選択モードのフローティングUI */}
+      {cellSelectionMode && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 p-4 min-w-80">
+          <div className="text-center mb-3">
+            <div className="text-sm font-semibold text-slate-800 dark:text-white mb-1">
+              {cellSelectionMode.type === 'corner' && `📍 セルをクリックして角を選択 (${cellSelectionMode.clickedCells.length}/4)`}
+              {cellSelectionMode.type === 'multiCorner' && `📍 セルをクリックして角を選択 (${cellSelectionMode.clickedCells.length}/4)`}
+              {cellSelectionMode.type === 'rangeStart' && `📍 範囲の2つのセルをクリック (${cellSelectionMode.clickedCells.length}/2)`}
+              {cellSelectionMode.type === 'individual' && `📍 個別セルをクリック (${cellSelectionMode.clickedCells.length}個選択中)`}
+            </div>
+            {cellSelectionMode.clickedCells.length > 0 && (
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                選択: {cellSelectionMode.clickedCells.map(c => `(${c.row},${c.col})`).join(', ')}
+              </div>
+            )}
+          </div>
+          <div className="flex gap-2 justify-center">
+            <button
+              onClick={handleConfirmCellSelection}
+              disabled={
+                ((cellSelectionMode.type === 'corner' || cellSelectionMode.type === 'multiCorner') && cellSelectionMode.clickedCells.length < 4) ||
+                (cellSelectionMode.type === 'rangeStart' && cellSelectionMode.clickedCells.length < 2) ||
+                (cellSelectionMode.type === 'individual' && cellSelectionMode.clickedCells.length === 0)
+              }
+              className="px-4 py-2 text-sm font-medium rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              範囲を反映
+            </button>
+            <button
+              onClick={handleCancelCellSelection}
+              className="px-4 py-2 text-sm font-medium rounded bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-300 dark:hover:bg-slate-600"
+            >
+              キャンセル
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ホール定義パネル */}
+      {hallDefinitionMode && currentMapData && (
+        <HallDefinitionPanel
+          isOpen={hallDefinitionMode}
+          onClose={() => { setHallDefinitionMode(false); setPendingVertexSelection(null); }}
+          mapData={currentMapData}
+          halls={currentHalls}
+          onUpdateHalls={handleUpdateHalls}
+          onStartVertexSelection={handleStartVertexSelection}
+          pendingVertexSelection={pendingVertexSelection}
+          onClearPendingVertexSelection={() => setPendingVertexSelection(null)}
+        />
+      )}
+
+      {/* 訪問先リストパネル */}
+      {visitListPanelOpen && currentMapData && (
+        <VisitListPanel
+          isOpen={visitListPanelOpen}
+          onClose={handleVisitListClose}
+          items={visitListItems}
+          onUpdateOrder={handleVisitListOrderUpdate}
+          mapData={currentMapData}
+          hallDefinitions={currentHalls}
+          hallOrder={visitListHallOrder}
+          layoutMode={layoutMode}
+          onHighlightCell={handleHighlightMapCell}
+          onClearHighlight={handleClearMapCellHighlight}
+          hasUnsavedChanges={visitListHasUnsavedChanges}
+          onConfirm={handleVisitListConfirm}
+          onCancel={handleVisitListCancel}
+          onUpdateItemPriority={handleUpdateItemPriority}
+        />
+      )}
+
+      {/* 訪問先リスト確認ダイアログ */}
+      {showVisitListConfirmDialog && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50">
+          <div className="bg-white dark:bg-slate-800 rounded-lg shadow-xl p-6 max-w-md w-full mx-4">
+            <h3 className="text-lg font-bold text-slate-900 dark:text-slate-100 mb-3">
+              変更を保存しますか？
+            </h3>
+            <p className="text-sm text-slate-600 dark:text-slate-400 mb-6">
+              訪問先リストに未保存の変更があります。確定して保存するか、キャンセルして破棄してください。
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={handleVisitListDialogCancel}
+                className="px-4 py-2 text-sm font-semibold rounded-md bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-300 dark:hover:bg-slate-600"
+              >
+                キャンセル（破棄）
+              </button>
+              <button
+                onClick={handleVisitListDialogConfirm}
+                className="px-4 py-2 text-sm font-semibold rounded-md bg-blue-600 text-white hover:bg-blue-700"
+              >
+                確定（保存）
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ホール頂点選択モードのフローティングUI */}
+      {vertexSelectionMode && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 p-4 min-w-80">
+          <div className="text-center mb-3">
+            <div className="text-sm font-semibold text-slate-800 dark:text-white mb-1">
+              📍 ホールの頂点をクリック ({vertexSelectionMode.clickedVertices.length}/4〜6)
+            </div>
+            <div className="text-xs text-slate-500 dark:text-slate-400 mb-1">
+              クリック順に多角形を作成します
+            </div>
+            {vertexSelectionMode.clickedVertices.length > 0 && (
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                選択: {vertexSelectionMode.clickedVertices.map(v => `(${v.row},${v.col})`).join(' → ')}
+              </div>
+            )}
+          </div>
+          <div className="flex gap-2 justify-center">
+            <button
+              onClick={handleConfirmVertexSelection}
+              disabled={vertexSelectionMode.clickedVertices.length < 4}
+              className="px-4 py-2 text-sm font-medium rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              確定
+            </button>
+            <button
+              onClick={handleCancelVertexSelection}
+              className="px-4 py-2 text-sm font-medium rounded bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-300 dark:hover:bg-slate-600"
+            >
+              キャンセル
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* マップファイル入力（非表示） */}
+      <input
+        type="file"
+        ref={mapFileInputRef}
+        accept=".xlsx"
+        onChange={handleMapFileChange}
+        style={{ display: 'none' }}
+      />
+
+      {/* エクスポートファイルインポート用入力（非表示） */}
+      <input
+        type="file"
+        ref={exportFileInputRef}
+        accept=".xlsx"
+        onChange={handleExportFileImport}
+        style={{ display: 'none' }}
+      />
+
       {activeEventName && items.length > 0 && mainContentVisible && (
         <>
-          {currentMode === 'execute' && <SummaryBar items={visibleItems} />}
+          {currentMode === 'execute' && (
+            <SummaryBar 
+              items={visibleItems} 
+              layoutMode={layoutMode}
+              onLayoutModeChange={setLayoutMode}
+            />
+          )}
         </>
       )}
       {activeEventName && items.length > 0 && mainContentVisible && (
