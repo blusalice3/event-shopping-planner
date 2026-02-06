@@ -16,13 +16,14 @@ import SortDescendingIcon from './components/icons/SortDescendingIcon';
 import SearchBar from './components/SearchBar';
 import { MapView, BlockDefinitionPanel, HallDefinitionPanel, isPointInPolygon } from './components/map';
 import VisitListPanel from './components/VisitListPanel';
+import FocusMode from './components/FocusMode';
 import { getItemKey, getItemKeyWithoutTitle, insertItemSorted } from './utils/itemComparison';
 import { parseMapFile } from './utils/xlsxMapParser';
 import { db } from './utils/indexedDB';
 import { exportToXlsx, importFromXlsx, downloadBlob } from './utils/exportImport';
 
 type ActiveTab = 'eventList' | 'import' | string; // string部分は動的な参加日（例: '1日目', '2日目', '3日目'など）
-type SortState = 'Manual' | 'Postpone' | 'Late' | 'Absent' | 'SoldOut' | 'Purchased';
+type SortState = 'Manual' | 'Postpone' | 'Late' | 'Absent' | 'SoldOut' | 'None' | 'Purchased';
 export type BulkSortDirection = 'asc' | 'desc';
 type BlockSortDirection = 'asc' | 'desc';
 
@@ -43,13 +44,14 @@ const extractEventDates = (items: ShoppingItem[]): string[] => {
   });
 };
 
-const sortCycle: SortState[] = ['Postpone', 'Late', 'Absent', 'SoldOut', 'Purchased', 'Manual'];
+const sortCycle: SortState[] = ['Manual', 'Postpone', 'Late', 'Absent', 'SoldOut', 'None', 'Purchased'];
 const sortLabels: Record<SortState, string> = {
     Manual: '巡回順',
     Postpone: '後回し',
     Late: '遅参',
     Absent: '欠席',
     SoldOut: '売切',
+    None: '未購入',
     Purchased: '購入済',
 };
 
@@ -74,12 +76,17 @@ const App: React.FC = () => {
   const [rangeStart, setRangeStart] = useState<{ itemId: string; columnType: 'execute' | 'candidate' } | null>(null);
   const [rangeEnd, setRangeEnd] = useState<{ itemId: string; columnType: 'execute' | 'candidate' } | null>(null);
 
+  // マップからの新規アイテム追加用の初期値
+  const [newItemDefaults, setNewItemDefaults] = useState<{ eventDate: string; block: string; number: string } | null>(null);
+
   // 更新機能用の状態
   const [showUpdateConfirmation, setShowUpdateConfirmation] = useState(false);
   const [updateData, setUpdateData] = useState<{
     itemsToDelete: ShoppingItem[];
     itemsToUpdate: ShoppingItem[];
     itemsToAdd: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[];
+    protectedFromDelete: number;
+    protectedFromUpdate: number;
   } | null>(null);
   const [updateEventName, setUpdateEventName] = useState<string | null>(null);
   const [showUrlUpdateDialog, setShowUrlUpdateDialog] = useState(false);
@@ -94,6 +101,17 @@ const App: React.FC = () => {
 
   // レイアウトモード状態
   const [layoutMode, setLayoutMode] = useState<'pc' | 'smartphone'>('pc');
+  
+  // 集中モード用: スマートフォンでマップ表示時にヘッダーを非表示
+  const [focusModeHideHeader, setFocusModeHideHeader] = useState(false);
+  
+  // ダークモード状態 ('system' | 'light' | 'dark')
+  const [themeMode, setThemeMode] = useState<'system' | 'light' | 'dark'>(() => {
+    if (typeof window !== 'undefined') {
+      return (localStorage.getItem('themeMode') as 'system' | 'light' | 'dark') || 'system';
+    }
+    return 'system';
+  });
 
   // マップ機能の状態
   const [mapData, setMapData] = useState<MapDataStore>({});
@@ -107,6 +125,41 @@ const App: React.FC = () => {
   
   // 保存フラグ（データ変更時のみ保存）
   const isSavingRef = useRef(false);
+
+  // テーマモードの適用
+  useEffect(() => {
+    const applyTheme = () => {
+      const html = document.documentElement;
+      
+      // data-theme属性を設定（CSS変数用）
+      html.setAttribute('data-theme', themeMode);
+      
+      // Tailwindのdarkクラスも同期
+      html.classList.remove('dark');
+      
+      if (themeMode === 'dark') {
+        html.classList.add('dark');
+      } else if (themeMode === 'light') {
+        // lightの場合はdarkクラスを付けない
+      } else {
+        // システム設定に従う
+        if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+          html.classList.add('dark');
+        }
+      }
+    };
+    
+    applyTheme();
+    localStorage.setItem('themeMode', themeMode);
+    
+    // システム設定の変更を監視（systemモードの場合のみ）
+    if (themeMode === 'system') {
+      const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+      const handler = () => applyTheme();
+      mediaQuery.addEventListener('change', handler);
+      return () => mediaQuery.removeEventListener('change', handler);
+    }
+  }, [themeMode]);
 
   // IndexedDBからデータを読み込み
   useEffect(() => {
@@ -235,6 +288,67 @@ const App: React.FC = () => {
     return hallRouteSettings[activeEventName]?.[activeTab] || { hallOrder: currentHalls.map(h => h.id), hallVisitLists: [] };
   }, [activeEventName, activeTab, isMapTab, hallRouteSettings, currentHalls]);
 
+  // ホール内の訪問先アイテム数を取得（優先・最優先グループも含む）
+  const getHallExecuteCount = useCallback((hallId: string): number => {
+    if (!activeEventName || !isMapTab || !currentMapData) return 0;
+    
+    const dayMatch = activeTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return 0;
+    const dayName = dayMatch[1];
+    
+    const executeIds = executeModeItems[activeEventName]?.[dayName] || [];
+    
+    return executeIds.filter(itemId => {
+      const item = items.find(i => i.id === itemId);
+      if (!item) return false;
+      
+      // ブロックからホールIDを判定
+      const block = currentMapData.blocks.find(b => b.name === item.block);
+      if (!block) return false;
+      
+      const centerRow = (block.startRow + block.endRow) / 2;
+      const centerCol = (block.startCol + block.endCol) / 2;
+      
+      for (const hall of currentHalls) {
+        if (hall.id === hallId && hall.vertices.length >= 4) {
+          if (isPointInPolygon(centerRow, centerCol, hall.vertices)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }).length;
+  }, [activeEventName, isMapTab, activeTab, currentMapData, currentHalls, items, executeModeItems]);
+
+  // ホール内の全アイテム数を取得
+  const getHallTotalItemCount = useCallback((hallId: string): number => {
+    if (!activeEventName || !isMapTab || !currentMapData) return 0;
+    
+    const dayMatch = activeTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return 0;
+    const dayName = dayMatch[1];
+    
+    const dayItems = items.filter(item => item.eventDate === dayName);
+    
+    return dayItems.filter(item => {
+      // ブロックからホールIDを判定
+      const block = currentMapData.blocks.find(b => b.name === item.block);
+      if (!block) return false;
+      
+      const centerRow = (block.startRow + block.endRow) / 2;
+      const centerCol = (block.startCol + block.endCol) / 2;
+      
+      for (const hall of currentHalls) {
+        if (hall.id === hallId && hall.vertices.length >= 4) {
+          if (isPointInPolygon(centerRow, centerCol, hall.vertices)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }).length;
+  }, [activeEventName, isMapTab, activeTab, currentMapData, currentHalls, items]);
+
   // 日付タブに対応するマップタブ名を取得（例: "1日目" → "1日目マップ"）
   const getMapTabForDate = useCallback((eventDate: string): string => {
     return `${eventDate}マップ`;
@@ -322,12 +436,19 @@ const App: React.FC = () => {
     return 'edit';
   }, [activeEventName, dayModes, activeTab, eventDates, isMapTab]);
 
-  const handleBulkAdd = useCallback((eventName: string, newItemsData: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[], metadata?: { url?: string; sheetName?: string; layoutInfo?: Array<{ itemKey: string, eventDate: string, columnType: 'execute' | 'candidate', order: number }> }) => {
+  const handleBulkAdd = useCallback((eventName: string, newItemsData: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[], metadata?: { url?: string; sheetName?: string; layoutInfo?: Array<{ itemKey: string, eventDate: string, columnType: 'execute' | 'candidate', order: number }>; source?: 'spreadsheet' | 'app' }) => {
+    // sourceを決定: metadataで指定されていればそれを使用、urlがあればspreadsheet、なければapp
+    const itemSource = metadata?.source ?? (metadata?.url ? 'spreadsheet' : 'app');
+    // デフォルトの保護レベル: appなら完全保護、spreadsheetなら保護なし
+    const defaultProtectionLevel = itemSource === 'app' ? 'full' : 'none';
+    
     const newItems: ShoppingItem[] = newItemsData.map(itemData => ({
         id: crypto.randomUUID(),
         ...itemData,
         quantity: itemData.quantity ?? 1,
         purchaseStatus: 'None' as PurchaseStatus,
+        source: itemSource,
+        protectionLevel: defaultProtectionLevel,
     }));
 
     const isNewEvent = !eventLists[eventName];
@@ -474,18 +595,33 @@ const App: React.FC = () => {
       // 購入状態が変更されたかチェック
       const currentItem = prev[activeEventName]?.find(item => item.id === updatedItem.id);
       const purchaseStatusChanged = currentItem && currentItem.purchaseStatus !== updatedItem.purchaseStatus;
+      const priceChanged = currentItem && currentItem.price !== updatedItem.price;
       
       // 購入状態が変更された場合、最近変更されたアイテムとして記録
       if (purchaseStatusChanged) {
         setRecentlyChangedItemIds(prevIds => new Set(prevIds).add(updatedItem.id));
       }
       
+      // 実行モード・集中モードで購入状態または価格が変更された場合、保護レベルを'deletable'に自動変更
+      // （明示的にprotectionLevelが設定されていない場合のみ）
+      const currentEventDate = eventDates.includes(activeTab) ? activeTab : (eventDates[0] || '');
+      const currentMode = dayModes[activeEventName]?.[currentEventDate] || 'edit';
+      let finalItem = updatedItem;
+      
+      if ((currentMode === 'execute' || currentMode === 'focus') && (purchaseStatusChanged || priceChanged)) {
+        // 現在の保護レベルがnone（保護なし）の場合のみ、deletable（削除のみ許可）に変更
+        const currentProtection = currentItem?.protectionLevel ?? (currentItem?.source === 'app' ? 'full' : 'none');
+        if (currentProtection === 'none') {
+          finalItem = { ...updatedItem, protectionLevel: 'deletable' as const };
+        }
+      }
+      
       return {
         ...prev,
-        [activeEventName]: prev[activeEventName].map(item => (item.id === updatedItem.id ? updatedItem : item))
+        [activeEventName]: prev[activeEventName].map(item => (item.id === updatedItem.id ? finalItem : item))
       };
     });
-  }, [activeEventName]);
+  }, [activeEventName, activeTab, eventDates, dayModes]);
 
   const handleMoveItem = useCallback((dragId: string, hoverId: string, targetColumn?: 'execute' | 'candidate', sourceColumn?: 'execute' | 'candidate') => {
     if (!activeEventName) return;
@@ -1213,6 +1349,39 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
     setSelectedItemIds(new Set());
     setCandidateNumberSortDirection(null);
   }, [activeEventName, activeTab, dayModes, eventDates]);
+  
+  // モードを直接設定する関数
+  const handleSetViewMode = useCallback((mode: ViewMode, scrollToItemId?: string) => {
+    if (!activeEventName) return;
+    
+    const currentEventDate = eventDates.includes(activeTab) ? activeTab : (eventDates[0] || '');
+    
+    setDayModes(prev => ({
+      ...prev,
+      [activeEventName]: {
+        ...(prev[activeEventName] || {}),
+        [currentEventDate]: mode
+      }
+    }));
+    
+    setSelectedItemIds(new Set());
+    setCandidateNumberSortDirection(null);
+    
+    // 集中モード以外に切り替えた場合、ヘッダーを再表示
+    if (mode !== 'focus') {
+      setFocusModeHideHeader(false);
+    }
+    
+    // スクロール先のアイテムIDが指定されている場合
+    if (scrollToItemId) {
+      setTimeout(() => {
+        const element = document.querySelector(`[data-item-id="${scrollToItemId}"]`);
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }, 100);
+    }
+  }, [activeEventName, activeTab, eventDates]);
   
   const handleSelectEvent = useCallback((eventName: string) => {
     setActiveEventName(eventName);
@@ -2017,16 +2186,9 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
         return;
       }
       
-      // イベント名の重複チェック
+      // イベント名の重複チェック - 同名がある場合は上書き更新
       let eventName = result.eventName;
-      if (eventLists[eventName]) {
-        const overwrite = confirm(`「${eventName}」は既に存在します。上書きしますか？\n\nキャンセルを押すと新しい名前で保存します。`);
-        if (!overwrite) {
-          const newName = prompt('新しいイベント名を入力してください:', `${eventName}_imported`);
-          if (!newName) return;
-          eventName = newName;
-        }
-      }
+      const isUpdate = !!eventLists[eventName];
       
       // アイテムを保存
       setEventLists(prev => ({
@@ -2093,8 +2255,10 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       // エラーがあれば表示
       if (result.errors.length > 0) {
         alert(`インポート完了（一部エラーあり）:\n${result.errors.join('\n')}`);
+      } else if (isUpdate) {
+        alert(`「${eventName}」を更新しました。\n${result.items.length}件のアイテム`);
       } else {
-        alert(`「${eventName}」をインポートしました。\n${result.items.length}件のアイテム`);
+        alert(`「${eventName}」を作成しました。\n${result.items.length}件のアイテム`);
       }
       
       // インポートしたイベントを選択
@@ -2247,12 +2411,28 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       const itemsToDelete: ShoppingItem[] = [];
       const itemsToUpdate: ShoppingItem[] = [];
       const itemsToAdd: Omit<ShoppingItem, 'id' | 'purchaseStatus'>[] = [];
+      let protectedFromDelete = 0;
+      let protectedFromUpdate = 0;
+
+      // 保護レベルを取得するヘルパー関数
+      const getEffectiveProtectionLevel = (item: ShoppingItem): 'full' | 'deletable' | 'none' => {
+        if (item.protectionLevel) return item.protectionLevel;
+        // sourceが'app'の場合はfull（完全保護）、それ以外（spreadsheetまたは未設定）はnone（保護なし）
+        return item.source === 'app' ? 'full' : 'none';
+      };
 
       // 削除対象: スプレッドシートにないアイテム（サークル名・参加日・ブロック・ナンバーで照合）
+      // ただし、保護レベルが'full'（完全保護）のアイテムは削除しない
       currentItems.forEach(item => {
         const keyWithoutTitle = getItemKeyWithoutTitle(item);
         if (!sheetItemsMapWithoutTitle.has(keyWithoutTitle)) {
-          itemsToDelete.push(item);
+          const protectionLevel = getEffectiveProtectionLevel(item);
+          // 完全保護（full）のアイテムは削除しない
+          if (protectionLevel !== 'full') {
+            itemsToDelete.push(item);
+          } else {
+            protectedFromDelete++;
+          }
         }
       });
 
@@ -2264,6 +2444,20 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
         // 完全一致（サークル名・参加日・ブロック・ナンバー・タイトル）で既存アイテムを検索
         const existingWithAll = currentItemsMapWithAll.get(keyWithAll);
         if (existingWithAll) {
+          // 保護レベルを確認
+          const protectionLevel = getEffectiveProtectionLevel(existingWithAll);
+          // 完全保護（full）または削除のみ許可（deletable）のアイテムは更新しない
+          if (protectionLevel === 'full' || protectionLevel === 'deletable') {
+            // 変更があるべきなのに保護されている場合のみカウント
+            if (
+              existingWithAll.price !== sheetItem.price ||
+              existingWithAll.remarks !== sheetItem.remarks ||
+              existingWithAll.url !== sheetItem.url
+            ) {
+              protectedFromUpdate++;
+            }
+            return;
+          }
           // 完全一致した場合、価格や備考、URLが変わっていれば更新
           if (
             existingWithAll.price !== sheetItem.price ||
@@ -2283,6 +2477,13 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
         // タイトルなしで既存アイテムを検索（タイトルが変更された場合）
         const existingWithoutTitle = currentItemsMapWithoutTitle.get(keyWithoutTitle);
         if (existingWithoutTitle) {
+          // 保護レベルを確認
+          const protectionLevel = getEffectiveProtectionLevel(existingWithoutTitle);
+          // 完全保護（full）または削除のみ許可（deletable）のアイテムは更新しない
+          if (protectionLevel === 'full' || protectionLevel === 'deletable') {
+            protectedFromUpdate++;
+            return;
+          }
           // タイトルや価格、備考、URLが変わっていれば更新
           itemsToUpdate.push({
             ...existingWithoutTitle,
@@ -2298,7 +2499,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
         itemsToAdd.push(sheetItem);
       });
 
-      setUpdateData({ itemsToDelete, itemsToUpdate, itemsToAdd });
+      setUpdateData({ itemsToDelete, itemsToUpdate, itemsToAdd, protectedFromDelete, protectedFromUpdate });
       setUpdateEventName(eventName);
       setShowUpdateConfirmation(true);
     } catch (error) {
@@ -2338,6 +2539,8 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
           quantity: itemData.quantity ?? 1,
           remarks: itemData.remarks,
           purchaseStatus: 'None' as PurchaseStatus,
+          source: 'spreadsheet' as const,  // スプレッドシートからの追加
+          protectionLevel: 'none' as const,  // デフォルトは保護なし
           ...(itemData.url ? { url: itemData.url } : {})
         };
         newItems = insertItemSorted(newItems, newItem);
@@ -2550,6 +2753,41 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
     });
   }, [activeEventName, activeTab, isMapTab, items, hallDefinitions, hallRouteSettings, mapData]);
 
+  // マップビューでの訪問先追加（位置指定あり）
+  const handleAddToExecuteListFromMapAtPosition = useCallback((itemId: string, referenceItemId: string, position: 'before' | 'after') => {
+    if (!activeEventName || !isMapTab) return;
+    
+    const dayMatch = activeTab.match(/^(.+)マップ$/);
+    if (!dayMatch) return;
+    const dayName = dayMatch[1];
+    
+    setExecuteModeItems(prev => {
+      const eventItems = prev[activeEventName] || {};
+      const dayItems = [...(eventItems[dayName] || [])];
+      
+      // 既に追加されている場合は何もしない
+      if (dayItems.includes(itemId)) return prev;
+      
+      // 参照アイテムの位置を探す
+      const refIndex = dayItems.indexOf(referenceItemId);
+      if (refIndex < 0) {
+        // 参照アイテムが見つからない場合は末尾に追加
+        dayItems.push(itemId);
+      } else {
+        const insertIndex = position === 'before' ? refIndex : refIndex + 1;
+        dayItems.splice(insertIndex, 0, itemId);
+      }
+      
+      return {
+        ...prev,
+        [activeEventName]: {
+          ...eventItems,
+          [dayName]: dayItems,
+        },
+      };
+    });
+  }, [activeEventName, activeTab, isMapTab]);
+
   // マップビューでの訪問先削除
   const handleRemoveFromExecuteListFromMap = useCallback((itemId: string) => {
     if (!activeEventName || !isMapTab) return;
@@ -2572,6 +2810,170 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
       };
     });
   }, [activeEventName, activeTab, isMapTab]);
+
+  // マップビューからの新規アイテム追加
+  const handleAddNewItemFromMap = useCallback((eventDate: string, block: string, number: string) => {
+    // 初期値を設定してアイテム追加タブに遷移
+    setNewItemDefaults({ eventDate, block, number });
+    setItemToEdit(null);
+    setActiveTab('import');
+  }, []);
+
+  // 集中モードからの直接アイテム追加
+  const handleAddItemFromFocusMode = useCallback((newItem: Omit<ShoppingItem, 'id'> & { purchaseStatus?: PurchaseStatus }) => {
+    if (!activeEventName) return;
+    
+    // 購入状態を決定（指定がなければ'None'）
+    const purchaseStatus = newItem.purchaseStatus || 'None';
+    
+    // 新しいアイテムを作成
+    const item: ShoppingItem = {
+      ...newItem,
+      id: `item-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      purchaseStatus,
+      source: 'app' as const,  // アプリからの追加
+      protectionLevel: 'full' as const,  // 完全保護
+    };
+    
+    // アイテムを追加
+    setEventLists(prev => ({
+      ...prev,
+      [activeEventName]: [...(prev[activeEventName] || []), item],
+    }));
+    
+    // 購入済の場合は候補リストのみに追加（実行列には追加しない）
+    if (purchaseStatus === 'Purchased') {
+      return;
+    }
+    
+    // 後回し・遅参の場合は実行列の適切なフェーズに最短経路位置で追加
+    const dayName = newItem.eventDate;
+    const mapTab = `${dayName}マップ`;
+    
+    setExecuteModeItems(prev => {
+      const eventItems = prev[activeEventName] || {};
+      const dayItems = [...(eventItems[dayName] || [])];
+      const allItems = eventLists[activeEventName] || [];
+      const itemsMap = new Map(allItems.map(i => [i.id, i]));
+      itemsMap.set(item.id, item); // 新アイテムも追加
+      
+      // マップデータとホール情報を取得
+      const currentMapData = mapData[activeEventName]?.[mapTab];
+      const halls = hallDefinitions[activeEventName]?.[mapTab] || [];
+      const hallSettings = hallRouteSettings[activeEventName]?.[mapTab];
+      
+      // ホール順序を取得
+      const hallOrder = hallSettings?.hallOrder || halls.map(h => h.id);
+      
+      // アイテムの座標を取得するヘルパー
+      const getItemPosition = (id: string): { row: number; col: number } | null => {
+        const targetItem = itemsMap.get(id);
+        if (!targetItem || !currentMapData) return null;
+        
+        const blockName = targetItem.block?.trim() || '';
+        const targetBlock = currentMapData.blocks.find(b => b.name === blockName);
+        if (!targetBlock) return null;
+        
+        // ナンバーセルの座標を探す
+        const numberCells = targetBlock.numberCells || [];
+        const normalizedNumber = targetItem.number.toLowerCase();
+        
+        for (const nc of numberCells) {
+          if (String(nc.value).toLowerCase() === normalizedNumber) {
+            return { row: nc.row, col: nc.col };
+          }
+        }
+        
+        // 見つからない場合はブロックの中心を返す
+        return {
+          row: (targetBlock.startRow + targetBlock.endRow) / 2,
+          col: (targetBlock.startCol + targetBlock.endCol) / 2,
+        };
+      };
+      
+      // 2点間の距離を計算
+      const calcDistance = (pos1: { row: number; col: number }, pos2: { row: number; col: number }): number => {
+        return Math.abs(pos1.row - pos2.row) + Math.abs(pos1.col - pos2.col);
+      };
+      
+      // 同じフェーズのアイテムのインデックスを収集
+      const phaseStatus = purchaseStatus; // 'Postpone' or 'Late'
+      const samePhaseIndices: number[] = [];
+      
+      for (let i = 0; i < dayItems.length; i++) {
+        const existingItem = itemsMap.get(dayItems[i]);
+        if (existingItem && existingItem.purchaseStatus === phaseStatus) {
+          samePhaseIndices.push(i);
+        }
+      }
+      
+      // 新アイテムの座標を取得
+      const newItemPos = getItemPosition(item.id);
+      
+      if (samePhaseIndices.length === 0 || !newItemPos) {
+        // 同じフェーズのアイテムがない場合は末尾に追加
+        dayItems.push(item.id);
+      } else {
+        // 同じフェーズのアイテム間で最短経路になる位置を探す
+        let bestInsertIndex = samePhaseIndices[samePhaseIndices.length - 1] + 1;
+        let minTotalDistance = Infinity;
+        
+        // 各挿入位置での総距離を計算
+        for (let insertIdx = 0; insertIdx <= samePhaseIndices.length; insertIdx++) {
+          let totalDistance = 0;
+          
+          // 挿入位置の前のアイテム
+          if (insertIdx > 0) {
+            const prevItemId = dayItems[samePhaseIndices[insertIdx - 1]];
+            const prevPos = getItemPosition(prevItemId);
+            if (prevPos) {
+              totalDistance += calcDistance(prevPos, newItemPos);
+            }
+          }
+          
+          // 挿入位置の後のアイテム
+          if (insertIdx < samePhaseIndices.length) {
+            const nextItemId = dayItems[samePhaseIndices[insertIdx]];
+            const nextPos = getItemPosition(nextItemId);
+            if (nextPos) {
+              totalDistance += calcDistance(newItemPos, nextPos);
+            }
+            
+            // 元々の前後の距離を引く（新アイテムを挿入することで不要になる距離）
+            if (insertIdx > 0) {
+              const prevItemId = dayItems[samePhaseIndices[insertIdx - 1]];
+              const prevPos = getItemPosition(prevItemId);
+              if (prevPos && nextPos) {
+                totalDistance -= calcDistance(prevPos, nextPos);
+              }
+            }
+          }
+          
+          if (totalDistance < minTotalDistance) {
+            minTotalDistance = totalDistance;
+            // 実際の挿入位置を計算
+            if (insertIdx === 0) {
+              bestInsertIndex = samePhaseIndices[0];
+            } else if (insertIdx === samePhaseIndices.length) {
+              bestInsertIndex = samePhaseIndices[samePhaseIndices.length - 1] + 1;
+            } else {
+              bestInsertIndex = samePhaseIndices[insertIdx];
+            }
+          }
+        }
+        
+        dayItems.splice(bestInsertIndex, 0, item.id);
+      }
+      
+      return {
+        ...prev,
+        [activeEventName]: {
+          ...eventItems,
+          [dayName]: dayItems,
+        },
+      };
+    });
+  }, [activeEventName, eventLists, mapData, hallDefinitions, hallRouteSettings]);
 
   // マップビューでの先頭移動
   const handleMoveToFirstFromMap = useCallback((itemId: string) => {
@@ -2645,6 +3047,12 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
   const [showVisitListConfirmDialog, setShowVisitListConfirmDialog] = useState(false);
   const [pendingTabChange, setPendingTabChange] = useState<string | null>(null);
   const [blockDefinitionMode, setBlockDefinitionMode] = useState(false);
+  
+  // マップビューのコントロール用状態（ヘッダーから制御）
+  const [mapSelectedHallId, setMapSelectedHallId] = useState<string>('all');
+  const [mapIsRouteVisible, setMapIsRouteVisible] = useState(true);
+  const [mapIsHallOrderOpen, setMapIsHallOrderOpen] = useState(false);
+  const [mapHallSelectorOpen, setMapHallSelectorOpen] = useState(false);
   
   // セル選択モードの状態（ブロック定義用）
   const [cellSelectionMode, setCellSelectionMode] = useState<{
@@ -3723,6 +4131,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 dark:bg-slate-900 dark:text-slate-200 font-sans">
+      {!focusModeHideHeader && (
       <header className="bg-white dark:bg-slate-800 shadow-sm sticky top-0 z-10">
         <div className="max-w-7xl mx-auto py-4 px-4 sm:px-6 lg:px-8 flex justify-between items-center">
           <div>
@@ -3755,7 +4164,199 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
                   </button>
                 )}
             </div>
-            {activeEventName && <h2 className="text-sm text-blue-600 dark:text-blue-400 font-semibold mt-1">{activeEventName}</h2>}
+            <div className="flex items-center gap-2 mt-1">
+              {activeEventName && <h2 className="text-sm text-blue-600 dark:text-blue-400 font-semibold">{activeEventName}</h2>}
+              {/* テーマ切り替えトグル */}
+              <button
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setThemeMode(prev => {
+                    const next = prev === 'system' ? 'light' : prev === 'light' ? 'dark' : 'system';
+                    return next;
+                  });
+                }}
+                className="p-2 rounded-md transition-colors hover:bg-slate-200 dark:hover:bg-slate-700 active:bg-slate-300 dark:active:bg-slate-600 touch-manipulation select-none"
+                title={themeMode === 'system' ? 'システム設定 → ライトモードへ' : themeMode === 'light' ? 'ライトモード → ダークモードへ' : 'ダークモード → システム設定へ'}
+                style={{ WebkitTapHighlightColor: 'transparent', minWidth: '44px', minHeight: '44px' }}
+                type="button"
+              >
+                {themeMode === 'system' ? (
+                  <svg className="w-5 h-5 text-slate-600 dark:text-slate-400 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                  </svg>
+                ) : themeMode === 'light' ? (
+                  <svg className="w-5 h-5 text-amber-500 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+                  </svg>
+                ) : (
+                  <svg className="w-5 h-5 text-indigo-400 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+                  </svg>
+                )}
+              </button>
+              
+              {/* モード切替アイコン（日付タブ表示時のみ） */}
+              {activeEventName && mainContentVisible && (
+                <div className="flex items-center gap-1 ml-2 border-l border-slate-300 dark:border-slate-600 pl-2">
+                  {/* 編集モード */}
+                  <button
+                    onClick={() => handleSetViewMode('edit')}
+                    className={`p-2 rounded-md transition-colors touch-manipulation select-none ${
+                      currentMode === 'edit'
+                        ? 'bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400'
+                        : 'hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-400'
+                    }`}
+                    title="編集モード"
+                    style={{ WebkitTapHighlightColor: 'transparent', minWidth: '40px', minHeight: '40px' }}
+                    type="button"
+                  >
+                    <span className="text-lg">📝</span>
+                  </button>
+                  
+                  {/* 実行モード */}
+                  <button
+                    onClick={() => handleSetViewMode('execute')}
+                    className={`p-2 rounded-md transition-colors touch-manipulation select-none ${
+                      currentMode === 'execute'
+                        ? 'bg-green-100 dark:bg-green-900/50 text-green-600 dark:text-green-400'
+                        : 'hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-400'
+                    }`}
+                    title="実行モード"
+                    style={{ WebkitTapHighlightColor: 'transparent', minWidth: '40px', minHeight: '40px' }}
+                    type="button"
+                  >
+                    <span className="text-lg">🏃</span>
+                  </button>
+                  
+                  {/* 集中モード */}
+                  <button
+                    onClick={() => handleSetViewMode('focus')}
+                    className={`p-2 rounded-md transition-colors touch-manipulation select-none ${
+                      currentMode === 'focus'
+                        ? 'bg-purple-100 dark:bg-purple-900/50 text-purple-600 dark:text-purple-400'
+                        : 'hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-400'
+                    }`}
+                    title="集中モード"
+                    style={{ WebkitTapHighlightColor: 'transparent', minWidth: '40px', minHeight: '40px' }}
+                    type="button"
+                  >
+                    <span className="text-lg">🔍</span>
+                  </button>
+                </div>
+              )}
+              
+              {/* マップコントロール（マップタブ表示時のみ） */}
+              {activeEventName && isMapTab && currentMapData && currentHalls.length > 0 && (
+                <>
+                  {/* ホール選択 */}
+                  <div className="relative">
+                    <button
+                      onClick={() => setMapHallSelectorOpen(!mapHallSelectorOpen)}
+                      className={`p-2 rounded-md transition-colors touch-manipulation select-none ${
+                        mapHallSelectorOpen 
+                          ? 'bg-slate-200 dark:bg-slate-700' 
+                          : 'hover:bg-slate-200 dark:hover:bg-slate-700 active:bg-slate-300 dark:active:bg-slate-600'
+                      }`}
+                      title={`表示ホール: ${mapSelectedHallId === 'all' ? '全ホール' : currentHalls.find(h => h.id === mapSelectedHallId)?.name || ''}`}
+                      style={{ WebkitTapHighlightColor: 'transparent', minWidth: '44px', minHeight: '44px' }}
+                      type="button"
+                    >
+                      {/* ホールアイコン（ビッグサイトシルエット風） */}
+                      <svg className="w-5 h-5 text-slate-600 dark:text-slate-400 pointer-events-none" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M2 18h3v-4h2v4h2v-6H7l-2-4-2 4H2v6zm5-8h2V8h2V6h2v2h2v2h2v8h-3v-4h-2v4h-3v-8z"/>
+                        <path d="M14 10h2v2h-2zM14 14h2v2h-2zM18 10h2v2h-2zM18 14h2v2h-2z"/>
+                      </svg>
+                    </button>
+                    {mapSelectedHallId !== 'all' && (
+                      <span className="absolute -top-1 -right-1 w-3 h-3 bg-blue-500 rounded-full"></span>
+                    )}
+                    
+                    {/* ホール選択ドロップダウンメニュー */}
+                    {mapHallSelectorOpen && (
+                      <>
+                        {/* 背景オーバーレイ（クリックで閉じる） */}
+                        <div 
+                          className="fixed inset-0 z-40"
+                          onClick={() => setMapHallSelectorOpen(false)}
+                        />
+                        <div className="absolute right-0 top-full mt-1 z-50 bg-white dark:bg-slate-800 rounded-lg shadow-lg border border-slate-200 dark:border-slate-700 py-1 min-w-[200px]">
+                          <button
+                            onClick={() => {
+                              setMapSelectedHallId('all');
+                              setMapHallSelectorOpen(false);
+                            }}
+                            className={`w-full px-4 py-2 text-left text-sm transition-colors ${
+                              mapSelectedHallId === 'all'
+                                ? 'bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300'
+                                : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+                            }`}
+                          >
+                            全ホール
+                          </button>
+                          {currentHalls.map((hall) => {
+                            const executeCount = getHallExecuteCount(hall.id);
+                            const totalCount = getHallTotalItemCount(hall.id);
+                            return (
+                              <button
+                                key={hall.id}
+                                onClick={() => {
+                                  setMapSelectedHallId(hall.id);
+                                  setMapHallSelectorOpen(false);
+                                }}
+                                className={`w-full px-4 py-2 text-left text-sm transition-colors flex justify-between items-center ${
+                                  mapSelectedHallId === hall.id
+                                    ? 'bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300'
+                                    : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+                                }`}
+                              >
+                                <span>{hall.name}</span>
+                                <span className="text-xs text-slate-500 dark:text-slate-400 ml-2">
+                                  ({executeCount}/{totalCount}件)
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  
+                  {/* ホール順序 */}
+                  <button
+                    onClick={() => setMapIsHallOrderOpen(true)}
+                    className="p-2 rounded-md transition-colors hover:bg-slate-200 dark:hover:bg-slate-700 active:bg-slate-300 dark:active:bg-slate-600 touch-manipulation select-none"
+                    title="ホール順序を編集"
+                    style={{ WebkitTapHighlightColor: 'transparent', minWidth: '44px', minHeight: '44px' }}
+                    type="button"
+                  >
+                    <svg className="w-5 h-5 text-slate-600 dark:text-slate-400 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                  </button>
+                  
+                  {/* ルート表示ON/OFF */}
+                  <button
+                    onClick={() => setMapIsRouteVisible(!mapIsRouteVisible)}
+                    className={`p-2 rounded-md transition-colors touch-manipulation select-none ${
+                      mapIsRouteVisible 
+                        ? 'bg-blue-100 dark:bg-blue-900/50 hover:bg-blue-200 dark:hover:bg-blue-800' 
+                        : 'hover:bg-slate-200 dark:hover:bg-slate-700 active:bg-slate-300 dark:active:bg-slate-600'
+                    }`}
+                    title={mapIsRouteVisible ? 'ルート表示ON' : 'ルート表示OFF'}
+                    style={{ WebkitTapHighlightColor: 'transparent', minWidth: '44px', minHeight: '44px' }}
+                    type="button"
+                  >
+                    {/* ルートアイコン */}
+                    <svg className={`w-5 h-5 pointer-events-none ${mapIsRouteVisible ? 'text-blue-600 dark:text-blue-400' : 'text-slate-600 dark:text-slate-400'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <circle cx="6" cy="6" r="2" strokeWidth={2} />
+                      <circle cx="18" cy="18" r="2" strokeWidth={2} />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 8v4a4 4 0 004 4h4M14 12l4 4m0 0l-4 4" />
+                    </svg>
+                  </button>
+                </>
+              )}
+            </div>
           </div>
           <div className="flex items-center gap-4">
               {activeEventName && mainContentVisible && items.length > 0 && selectedItemIds.size > 0 && (
@@ -3844,6 +4445,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
             </div>
         </div>
       </header>
+      )}
 
       <main className="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
         {activeTab === 'eventList' && (
@@ -3865,6 +4467,8 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
              itemToEdit={itemToEdit}
              onUpdateItem={handleUpdateItem}
              onDoneEditing={handleDoneEditing}
+             newItemDefaults={newItemDefaults}
+             onClearNewItemDefaults={() => setNewItemDefaults(null)}
            />
         )}
         {/* マップビュー */}
@@ -3875,6 +4479,7 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
             items={items}
             executeModeItemIds={currentMapExecuteItemIds}
             onAddToExecuteList={handleAddToExecuteListFromMap}
+            onAddToExecuteListAtPosition={handleAddToExecuteListFromMapAtPosition}
             onRemoveFromExecuteList={handleRemoveFromExecuteListFromMap}
             onMoveToFirst={handleMoveToFirstFromMap}
             onMoveToLast={handleMoveToLastFromMap}
@@ -3883,12 +4488,21 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
               const item = items.find(i => i.id === itemId);
               if (item) handleDeleteRequest(item);
             }}
+            onAddNewItem={handleAddNewItemFromMap}
             halls={currentHalls}
             hallRouteSettings={currentHallRouteSettings}
             onUpdateHallRouteSettings={handleUpdateHallRouteSettings}
             onReorderExecuteList={handleReorderExecuteListByHallOrder}
             vertexSelectionMode={vertexSelectionMode}
+            cellSelectionMode={cellSelectionMode}
             highlightedCell={visitListPanelOpen ? highlightedMapCell : null}
+            externalSelectedHallId={mapSelectedHallId}
+            onSelectedHallIdChange={setMapSelectedHallId}
+            externalIsRouteVisible={mapIsRouteVisible}
+            onRouteVisibleChange={setMapIsRouteVisible}
+            externalIsHallOrderOpen={mapIsHallOrderOpen}
+            onHallOrderOpenChange={setMapIsHallOrderOpen}
+            hideInternalControls={true}
           />
         )}
         {activeEventName && mainContentVisible && (
@@ -4013,6 +4627,22 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
                   />
                 </div>
               </div>
+            ) : currentMode === 'focus' ? (
+              <FocusMode
+                items={items}
+                executeModeItemIds={executeModeItems[activeEventName]?.[eventDates.includes(activeTab) ? activeTab : (eventDates[0] || '')] || []}
+                onUpdateItem={handleUpdateItem}
+                onModeChange={(mode, lastItemId) => handleSetViewMode(mode, lastItemId)}
+                layoutMode={layoutMode}
+                onLayoutModeChange={setLayoutMode}
+                mapData={activeEventName ? mapData[activeEventName] : undefined}
+                hallDefinitions={activeEventName && activeTab ? hallDefinitions[activeEventName]?.[`${eventDates.includes(activeTab) ? activeTab : (eventDates[0] || '')}マップ`] : undefined}
+                onHideHeader={setFocusModeHideHeader}
+                onAddItem={handleAddItemFromFocusMode}
+                onEditRequest={handleEditRequest}
+                onDeleteRequest={handleDeleteRequest}
+                appZoomLevel={zoomLevel}
+              />
             ) : (
               <ShoppingList
                 items={visibleItems}
@@ -4051,6 +4681,8 @@ const handleMoveItemDown = useCallback((itemId: string, targetColumn?: 'execute'
           itemsToDelete={updateData.itemsToDelete}
           itemsToUpdate={updateData.itemsToUpdate}
           itemsToAdd={updateData.itemsToAdd}
+          protectedFromDelete={updateData.protectedFromDelete}
+          protectedFromUpdate={updateData.protectedFromUpdate}
           onConfirm={handleConfirmUpdate}
           onCancel={() => {
             setShowUpdateConfirmation(false);
